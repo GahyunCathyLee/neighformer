@@ -1,0 +1,8 @@
+ckpts/
+
+*.csv
+*.npy
+*.pt
+*.yaml
+
+__pycache__/
