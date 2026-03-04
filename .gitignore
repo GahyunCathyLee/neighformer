@@ -2,6 +2,7 @@ ckpts/
 
 *.csv
 *.npy
+*.npz
 *.pt
 *.yaml
 
