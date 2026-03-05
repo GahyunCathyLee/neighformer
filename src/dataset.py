@@ -277,13 +277,13 @@ class HighDDataset(Dataset):
         )
 
         # ── normalize ─────────────────────────────────────────────────────────
+        # stats는 compute_stats()에서 이미 feature 조합에 맞게 슬라이싱되어 저장됩니다.
+        # ego_mean: (ego_dim,)  nb_mean: (nb_dim,)  → 그대로 브로드캐스팅
         if self.stats is not None:
             if self._ego_mean is not None:
-                sl = _EGO_MODE_SLICES[self.ego_mode]
-                x_ego = (x_ego - self._ego_mean[sl]) / self._ego_std[sl].clamp_min(1e-2)
+                x_ego = (x_ego - self._ego_mean) / self._ego_std.clamp_min(1e-2)
             if self._nb_mean is not None:
-                x_nb = (x_nb - self._nb_slice_stats(self._nb_mean)) \
-                     / self._nb_slice_stats(self._nb_std).clamp_min(1e-2)
+                x_nb = (x_nb - self._nb_mean) / self._nb_std.clamp_min(1e-2)
 
         # ── output dict ───────────────────────────────────────────────────────
         out: Dict[str, Any] = {
@@ -304,37 +304,6 @@ class HighDDataset(Dataset):
             }
 
         return out
-
-    # ── stats 슬라이싱 헬퍼 ───────────────────────────────────────────────────
-
-    def _nb_slice_stats(self, stats_vec: torch.Tensor) -> torch.Tensor:
-        """
-        stats.npz 의 nb_mean/nb_std 는 x_nb 전체 12-dim 기준입니다.
-        현재 설정으로 선택된 feature 차원에 맞게 슬라이싱합니다.
-        """
-        parts: List[torch.Tensor] = []
-
-        if self.nb_kin_mode != "none":
-            if self.nb_kin_mode == "pa":
-                parts.append(torch.cat([stats_vec[0:2], stats_vec[4:6]]))
-            else:
-                sl = _NB_KIN_MODE_SLICES[self.nb_kin_mode]
-                parts.append(stats_vec[sl])
-
-        if self.use_lc_state:
-            parts.append(stats_vec[_NB_IDX_LC    : _NB_IDX_LC    + 1])
-        if self.use_dx_time:
-            parts.append(stats_vec[_NB_IDX_DXTIME: _NB_IDX_DXTIME + 1])
-        if self.use_gate:
-            parts.append(stats_vec[_NB_IDX_GATE  : _NB_IDX_GATE  + 1])
-        if self.use_I_x:
-            parts.append(stats_vec[_NB_IDX_IX    : _NB_IDX_IX    + 1])
-        if self.use_I_y:
-            parts.append(stats_vec[_NB_IDX_IY    : _NB_IDX_IY    + 1])
-        if self.use_I:
-            parts.append(stats_vec[_NB_IDX_I     : _NB_IDX_I     + 1])
-
-        return torch.cat(parts)   # (D_nb,)  — broadcasting 자동 처리
 
     # ── 편의 property ─────────────────────────────────────────────────────────
 
