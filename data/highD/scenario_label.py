@@ -21,7 +21,7 @@ Usage (standalone):
     python scenario_label.py \\
         --data_dir  data/highD \\
         --raw_dir   raw \\
-        --out_csv   data/highD/mmap/window_labels.csv \\
+        --out_csv   window_labels.csv \\
         --history_sec 2 --future_sec 5 --target_hz 3
 
 Usage (from mmap metadata):
@@ -29,7 +29,7 @@ Usage (from mmap metadata):
         --data_dir  data/highD \\
         --raw_dir   raw \\
         --mmap_dir  mmap \\
-        --out_csv   data/highD/mmap/window_labels.csv \\
+        --out_csv   window_labels.csv \\
         --history_sec 2 --future_sec 5 --target_hz 3
 """
 
@@ -548,6 +548,40 @@ def label_recording(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Multiprocessing worker  (module-level for pickling)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _process_one_recording(
+    item: Tuple,
+    raw_dir: Path,
+    history_sec: float,
+    future_sec: float,
+    target_hz: float,
+    stride_sec: float,
+    W_adj: int,
+) -> Tuple[List[Dict], Optional[List[Tuple[int, int]]], Optional[List[int]]]:
+    xx, keys = item
+    if keys is not None:
+        keys_for_rec  = [(tid, t0) for tid, t0, _ in keys]
+        mmap_idx_list = [idx       for _,   _,  idx in keys]
+    else:
+        keys_for_rec  = None
+        mmap_idx_list = None
+
+    rows = label_recording(
+        xx          = xx,
+        raw_dir     = raw_dir,
+        keys        = keys_for_rec,
+        history_sec = history_sec,
+        future_sec  = future_sec,
+        target_hz   = target_hz,
+        stride_sec  = stride_sec,
+        W_adj       = W_adj,
+    )
+    return rows, keys_for_rec, mmap_idx_list
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -559,7 +593,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--data_dir",     default="data/highD",          help="Base data directory")
     ap.add_argument("--raw_dir",      default="raw",                 help="Raw CSV subdir under data_dir")
     ap.add_argument("--mmap_dir",     default="mmap",                help="Mmap subdir under data_dir (leave empty for standalone mode)")
-    ap.add_argument("--out_csv",      default="scenario_labels.csv", help="Output CSV path")
+    ap.add_argument("--out_csv",      default="scenario_labels.csv", help="Output CSV filename (saved inside mmap_dir)")
 
     ap.add_argument("--history_sec",  type=float, default=2.0)
     ap.add_argument("--future_sec",   type=float, default=5.0)
@@ -574,14 +608,14 @@ def main() -> None:
     args   = parse_args()
     data_dir = Path(args.data_dir)
     raw_dir  = data_dir / args.raw_dir
-    out_csv  = Path(args.out_csv)
+    mmap_dir = data_dir / args.mmap_dir
+    out_csv  = mmap_dir / args.out_csv
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
     # ── Determine mode ────────────────────────────────────────────────────────
     keys_by_xx: Optional[Dict[str, List[Tuple[int, int, int]]]] = None  # (tid, t0, mmap_idx)
 
     if args.mmap_dir:
-        mmap_dir = data_dir / args.mmap_dir
         rec_path = mmap_dir / "meta_recordingId.npy"
         trk_path = mmap_dir / "meta_trackId.npy"
         t0_path  = mmap_dir / "meta_frame.npy"
@@ -628,32 +662,14 @@ def main() -> None:
     n_workers = args.num_workers if args.num_workers > 0 else os.cpu_count()
     print(f"[Process] {len(keys_by_xx)} recordings  |  workers={n_workers}")
 
-    def _process_one(item):
-        xx, keys = item
-        if keys is not None:
-            keys_for_rec  = [(tid, t0) for tid, t0, _ in keys]
-            mmap_idx_list = [idx       for _,   _,  idx in keys]
-        else:
-            keys_for_rec  = None
-            mmap_idx_list = None
-
-        rows = label_recording(
-            xx          = xx,
-            raw_dir     = raw_dir,
-            keys        = keys_for_rec,
-            history_sec = args.history_sec,
-            future_sec  = args.future_sec,
-            target_hz   = args.target_hz,
-            stride_sec  = args.stride_sec,
-            W_adj       = args.W_adj,
-        )
-        return rows, keys_for_rec, mmap_idx_list
-
     all_rows: List[Dict] = []
     items = sorted(keys_by_xx.items())
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as exe:
-        futs = {exe.submit(_process_one, item): item[0] for item in items}
+        futs = {exe.submit(_process_one_recording, item,
+                           raw_dir, args.history_sec, args.future_sec,
+                           args.target_hz, args.stride_sec, args.W_adj): item[0]
+                for item in items}
         for fut in tqdm(concurrent.futures.as_completed(futs),
                         total=len(futs), desc="Labeling recordings"):
             rows, keys_for_rec, mmap_idx_list = fut.result()

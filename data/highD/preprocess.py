@@ -42,7 +42,6 @@ y          : (N, Tf, 2)     future [x, y]
 y_vel      : (N, Tf, 2)     future [xV, yV]
 y_acc      : (N, Tf, 2)     future [xA, yA]
 nb_mask    : (N, T, K)      bool - True if neighbor exists
-ego_safety : (N, T, 5)      [leadDHW, leadDV, leadTHW, leadTTC, lead_exists]
 x_last_abs : (N, 2)         last absolute (x, y) of ego history
 meta_recordingId / trackId / t0_frame : (N,)
 
@@ -336,8 +335,6 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     for c in ["xVelocity", "yVelocity", "xAcceleration", "yAcceleration"]:
         if c not in tracks.columns: tracks[c] = 0.0
     if "laneId" not in tracks.columns: tracks["laneId"] = 0
-    for c in ["dhw", "thw", "ttc"]:
-        if c not in tracks.columns: tracks[c] = 0.0
 
     # ── per-vehicle lookups ─────────────────────────────────────────────────
     vid_to_dd  = dict(zip(trk_meta["id"].astype(int), trk_meta["drivingDirection"].astype(int)))
@@ -405,17 +402,9 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
         [tracks[c].astype(np.int32).to_numpy() for c in NEIGHBOR_COLS_8], axis=1
     )
 
-    # ── sanitise safety metrics ──────────────────────────────────────────────
-    dhw = tracks["dhw"].astype(np.float32).to_numpy()
-    thw = tracks["thw"].astype(np.float32).to_numpy()
-    ttc = tracks["ttc"].astype(np.float32).to_numpy()
-    ttc = np.clip(np.where((~np.isfinite(ttc)) | (ttc < 0.0), -1.0, ttc), -1.0,  90.0)
-    thw = np.clip(np.where((~np.isfinite(thw)) | (thw <= 0.5), -1.0, thw), -1.0,  20.0)
-    dhw = np.clip(np.where((~np.isfinite(dhw)) | (dhw <= 10.0), -1.0, dhw), -1.0, 150.0)
 
     # ── sample loop ─────────────────────────────────────────────────────────
     x_ego_list:      List[np.ndarray] = []
-    ego_safety_list: List[np.ndarray] = []
     y_fut_list:      List[np.ndarray] = []
     y_vel_list:      List[np.ndarray] = []
     y_acc_list:      List[np.ndarray] = []
@@ -449,23 +438,6 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
             ex  = x[ego_rows];  ey  = y[ego_rows]
             exv = xv[ego_rows]; eyv = yv[ego_rows]
             exa = xa[ego_rows]; eya = ya[ego_rows]
-
-            # ── ego_safety ──────────────────────────────────────────────────
-            lead_ids    = nb_ids_all[ego_rows, 0]
-            lead_exists = (lead_ids > 0).astype(np.float32)
-            l_dhw = np.where(lead_exists > 0, dhw[ego_rows], 0.0).astype(np.float32)
-            l_thw = np.where(lead_exists > 0, thw[ego_rows], 0.0).astype(np.float32)
-            l_ttc = np.where(lead_exists > 0, ttc[ego_rows], 0.0).astype(np.float32)
-            l_dv  = np.zeros(T, np.float32)
-            for i, (hf, lid) in enumerate(zip(hist_frames, lead_ids.tolist())):
-                if lid <= 0: continue
-                rm = per_vid_frame_to_row.get(int(lid))
-                if rm is None: continue
-                r = rm.get(int(hf))
-                if r is None: continue
-                l_dv[i] = float(xv[r] - exv[i])
-            l_dv = np.where(lead_exists > 0, l_dv, 0.0).astype(np.float32)
-            ego_safety = np.stack([l_dhw, l_dv, l_thw, l_ttc, lead_exists], axis=1)
 
             # ── x_ego : (T, EGO_DIM=6) ─────────────────────────────────────
             x_ego = np.stack([ex, ey, exv, eyv, exa, eya], axis=1).astype(np.float32)
@@ -567,7 +539,6 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
 
             x_ego_list.append(x_ego)
-            ego_safety_list.append(ego_safety)
             y_fut_list.append(y_fut)
             y_vel_list.append(y_vel)
             y_acc_list.append(y_acc)
@@ -583,10 +554,8 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
         return None
 
     n_kept = len(x_ego_list)
-    print(f"  [{rec_id}] kept={n_kept}")
     return {
         "x_ego":       _safe_float(np.stack(x_ego_list,      0)),
-        "ego_safety":  _safe_float(np.stack(ego_safety_list, 0)),
         "y":           _safe_float(np.stack(y_fut_list,       0)),
         "y_vel":       _safe_float(np.stack(y_vel_list,       0)),
         "y_acc":       _safe_float(np.stack(y_acc_list,       0)),
@@ -646,7 +615,6 @@ def stage_raw2mmap(cfg: Config) -> None:
         "y_acc":      open_memmap(out / "y_acc.npy",       "w+", "float32", (total, *s0["y_acc"].shape[1:])),
         "x_nb":       open_memmap(out / "x_nb.npy",        "w+", "float32", (total, *s0["x_nb"].shape[1:])),
         "nb_mask":    open_memmap(out / "nb_mask.npy",     "w+", "bool",    (total, *s0["nb_mask"].shape[1:])),
-        "ego_safety": open_memmap(out / "ego_safety.npy",  "w+", "float32", (total, *s0["ego_safety"].shape[1:])),
         "x_last_abs": open_memmap(out / "x_last_abs.npy",  "w+", "float32", (total, 2)),
     }
     meta_rec   = np.zeros(total, np.int32)
@@ -666,7 +634,7 @@ def stage_raw2mmap(cfg: Config) -> None:
         n   = buf["x_ego"].shape[0]
         end = cursor + n
 
-        for key in ["x_ego", "y", "y_vel", "y_acc", "x_nb", "nb_mask", "ego_safety"]:
+        for key in ["x_ego", "y", "y_vel", "y_acc", "x_nb", "nb_mask"]:
             fp[key][cursor:end] = buf[key]
 
         fp["x_last_abs"][cursor:end] = buf["x_ego"][:, -1, 0:2]
