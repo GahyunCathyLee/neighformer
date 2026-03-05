@@ -4,6 +4,6 @@ ckpts/
 *.npy
 *.npz
 *.pt
-*.yaml
+tensorboard/
 
 __pycache__/
