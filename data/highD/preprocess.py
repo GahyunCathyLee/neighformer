@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-preprocess.py  —  HighD preprocessing pipeline  (raw CSV → mmap)
+highd_pipeline.py  —  HighD preprocessing pipeline  (raw CSV → mmap)
 
 STAGE raw2mmap :  highD raw CSV  →  memory-mapped arrays
 
@@ -53,7 +53,7 @@ Importance formula
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Usage
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  python preprocess.py \\
+  python highd_pipeline.py \\
       --raw_dir  data/highD/raw \\
       --mmap_dir data/highD/mmap
 """
@@ -259,8 +259,8 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
     frame   = tracks["frame"].astype(np.int32).to_numpy()
     vid     = tracks["id"].astype(np.int32).to_numpy()
-    x       = tracks["x"].astype(np.float32).to_numpy()
-    y       = tracks["y"].astype(np.float32).to_numpy()
+    x       = tracks["x"].astype(np.float32).to_numpy().copy()
+    y       = tracks["y"].astype(np.float32).to_numpy().copy()
     w_row   = np.array([vid_to_w.get(int(v), 0.0) for v in vid], np.float32)
     h_row   = np.array([vid_to_l.get(int(v), 0.0) for v in vid], np.float32)
     x      += 0.5 * w_row
