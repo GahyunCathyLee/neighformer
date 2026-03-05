@@ -1,0 +1,10 @@
+# Core
+numpy>=1.24
+torch>=2.1
+
+# Training utilities
+tqdm>=4.66
+pyyaml>=6.0
+pandas
+scikit-learn
+tensorboard
