@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 scenario_label.py  —  Window-level scenario labeling for highD tracks.
 
@@ -35,12 +36,15 @@ Usage (from mmap metadata):
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -552,16 +556,17 @@ def parse_args() -> argparse.Namespace:
         description="highD window-level scenario labeling",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--data_dir",    default="data/highD",    help="Base data directory")
-    ap.add_argument("--raw_dir",     default="raw",           help="Raw CSV subdir under data_dir")
-    ap.add_argument("--mmap_dir",    default="",              help="Mmap subdir under data_dir (leave empty for standalone mode)")
-    ap.add_argument("--out_csv",     required=True,           help="Output CSV path")
+    ap.add_argument("--data_dir",     default="data/highD",          help="Base data directory")
+    ap.add_argument("--raw_dir",      default="raw",                 help="Raw CSV subdir under data_dir")
+    ap.add_argument("--mmap_dir",     default="mmap",                help="Mmap subdir under data_dir (leave empty for standalone mode)")
+    ap.add_argument("--out_csv",      default="scenario_labels.csv", help="Output CSV path")
 
-    ap.add_argument("--history_sec", type=float, default=2.0)
-    ap.add_argument("--future_sec",  type=float, default=5.0)
-    ap.add_argument("--target_hz",   type=float, default=3.0)
-    ap.add_argument("--stride_sec",  type=float, default=1.0, help="Stride (standalone mode only)")
-    ap.add_argument("--W_adj",       type=int,   default=10,  help="Pre-LC look-back window (native frames)")
+    ap.add_argument("--history_sec",  type=float, default=2.0)
+    ap.add_argument("--future_sec",   type=float, default=5.0)
+    ap.add_argument("--target_hz",    type=float, default=3.0)
+    ap.add_argument("--stride_sec",   type=float, default=1.0,  help="Stride (standalone mode only)")
+    ap.add_argument("--W_adj",        type=int,   default=25,   help="Pre-LC look-back window (native frames). 25 = 1sec at 25fps")
+    ap.add_argument("--num_workers",  type=int,   default=0,    help="Worker processes (0 = os.cpu_count())")
     return ap.parse_args()
 
 
@@ -619,14 +624,12 @@ def main() -> None:
         state_occ    = None
         print(f"[Mode] standalone  |  {len(keys_by_xx)} recordings  |  stride={args.stride_sec}s")
 
-    # ── Process recordings ────────────────────────────────────────────────────
-    all_rows: List[Dict] = []
+    # ── Process recordings (parallel) ────────────────────────────────────────
+    n_workers = args.num_workers if args.num_workers > 0 else os.cpu_count()
+    print(f"[Process] {len(keys_by_xx)} recordings  |  workers={n_workers}")
 
-    for xx, keys in sorted(keys_by_xx.items()):
-        n_keys = len(keys) if keys is not None else "all"
-        print(f"  [{xx}] windows={n_keys}")
-
-        # mmap mode: (tid, t0, mmap_idx) → label_recording에는 (tid, t0)만 전달
+    def _process_one(item):
+        xx, keys = item
         if keys is not None:
             keys_for_rec  = [(tid, t0) for tid, t0, _ in keys]
             mmap_idx_list = [idx       for _,   _,  idx in keys]
@@ -644,25 +647,35 @@ def main() -> None:
             stride_sec  = args.stride_sec,
             W_adj       = args.W_adj,
         )
+        return rows, keys_for_rec, mmap_idx_list
 
-        # state label 조인
-        if state_labels is not None and mmap_idx_list is not None:
-            idx_map = {(tid, t0): mmap_idx_list[i]
-                       for i, (tid, t0) in enumerate(keys_for_rec)}
-            for row in rows:
-                mi = idx_map.get((row["trackId"], row["t0_frame"]))
-                if mi is not None:
-                    row["state_label"] = state_labels[mi]
-                    row["occupancy"]   = float(state_occ[mi])
-                else:
+    all_rows: List[Dict] = []
+    items = sorted(keys_by_xx.items())
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as exe:
+        futs = {exe.submit(_process_one, item): item[0] for item in items}
+        for fut in tqdm(concurrent.futures.as_completed(futs),
+                        total=len(futs), desc="Labeling recordings"):
+            rows, keys_for_rec, mmap_idx_list = fut.result()
+
+            # state label 조인
+            if state_labels is not None and mmap_idx_list is not None:
+                idx_map = {(tid, t0): mmap_idx_list[i]
+                           for i, (tid, t0) in enumerate(keys_for_rec)}
+                for row in rows:
+                    mi = idx_map.get((row["trackId"], row["t0_frame"]))
+                    if mi is not None:
+                        row["state_label"] = state_labels[mi]
+                        row["occupancy"]   = float(state_occ[mi])
+                    else:
+                        row["state_label"] = "unknown"
+                        row["occupancy"]   = float("nan")
+            else:
+                for row in rows:
                     row["state_label"] = "unknown"
                     row["occupancy"]   = float("nan")
-        else:
-            for row in rows:
-                row["state_label"] = "unknown"
-                row["occupancy"]   = float("nan")
 
-        all_rows.extend(rows)
+            all_rows.extend(rows)
 
     # ── Save ─────────────────────────────────────────────────────────────────
     df = pd.DataFrame(all_rows)
