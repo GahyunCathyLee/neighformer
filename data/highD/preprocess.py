@@ -150,6 +150,7 @@ class Config:
 
     # output / execution
     calc_stats:  bool = False
+    dry_run:     bool = False
     num_workers: int  = 0   # 0 = os.cpu_count()
 
     # stage
@@ -581,6 +582,8 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
         print(f"  [WARN] {rec_id}: no samples produced.")
         return None
 
+    n_kept = len(x_ego_list)
+    print(f"  [{rec_id}] kept={n_kept}")
     return {
         "x_ego":       _safe_float(np.stack(x_ego_list,      0)),
         "ego_safety":  _safe_float(np.stack(ego_safety_list, 0)),
@@ -626,6 +629,10 @@ def stage_raw2mmap(cfg: Config) -> None:
 
     total              = sum(b["x_ego"].shape[0] for b in bufs)
     print(f"  total kept     : {total}")
+
+    if cfg.dry_run:
+        print("[DRY RUN] No files written.")
+        return
 
     # ── allocate memmaps (총 샘플 수를 알고 있으므로 한 번에 할당) ────────────
     out = cfg.mmap_path
@@ -773,6 +780,7 @@ def parse_args() -> Config:
     # output
     ap.add_argument("--calc_stats", action="store_true",
                     help="Compute and save stats.npz during raw2mmap stage.")
+    ap.add_argument("--dry_run", action="store_true")
 
     a = ap.parse_args()
     return Config(
@@ -790,6 +798,7 @@ def parse_args() -> Config:
         eps_gate = a.eps_gate,
         importance_dl_mode = a.importance_dl_mode,
         calc_stats  = a.calc_stats,
+        dry_run     = a.dry_run,
         num_workers = a.num_workers,
         stage       = a.stage,
     )
