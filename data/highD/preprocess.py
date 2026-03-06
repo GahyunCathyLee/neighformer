@@ -124,6 +124,9 @@ class Config:
     vy_eps:   float = 0.27
     eps_gate: float = 0.1
 
+    # lc_state version
+    lc_version: str = "v2"           # "v1" (slot-based, tf_trajPred) | "v2" (dy-sign-based, neighformer)
+
     # importance
     importance_dl_mode: str = "dy"   # "dy" | "lane_id" | "lc_state"
 
@@ -369,21 +372,36 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     x_nb[ti, ki, 0:6] = rel
                     nb_mask[ti, ki]   = True
 
-                    win_frames = [hf - w * step for w in range(int(round(cfg.target_hz)))]
-                    yv_vals = []
-                    for wf in win_frames:
-                        wr = per_vid_frame_to_row.get(nid, {}).get(int(wf))
-                        if wr is not None:
-                            yv_vals.append(float(yv[wr]))
-                    vyn = float(np.mean(yv_vals)) if yv_vals else float(yv[r])
+                    # ── lc_state v1: slot-based, 현재 프레임 절대 yVelocity (tf_trajPred 방식) ──
+                    # ── lc_state v2: dy부호 + 윈도우 평균 yVelocity             (neighformer 방식) ──
+                    if cfg.lc_version == "v1":
+                        vyn = float(yv[r])
+                        if ki < 2:                          # same-lane lead / rear
+                            lc_state = 0.0
+                        elif ki < 5:                        # left group (slots 2,3,4)
+                            if   vyn >  cfg.vy_eps: lc_state = -1.0  # toward ego lane
+                            elif vyn < -cfg.vy_eps: lc_state = -3.0  # away from ego lane
+                            else:                   lc_state = -2.0  # staying
+                        else:                               # right group (slots 5,6,7)
+                            if   vyn < -cfg.vy_eps: lc_state =  1.0  # toward ego lane
+                            elif vyn >  cfg.vy_eps: lc_state =  3.0  # away from ego lane
+                            else:                   lc_state =  2.0  # staying
+                    else:                                   # v2 (default)
+                        win_frames = [hf - w * step for w in range(int(round(cfg.target_hz)))]
+                        yv_vals = []
+                        for wf in win_frames:
+                            wr = per_vid_frame_to_row.get(nid, {}).get(int(wf))
+                            if wr is not None:
+                                yv_vals.append(float(yv[wr]))
+                        vyn = float(np.mean(yv_vals)) if yv_vals else float(yv[r])
 
-                    dy_sign = float(rel[1])
-                    if abs(vyn) < cfg.vy_eps:
-                        lc_state = 1.0
-                    elif dy_sign * vyn > 0:
-                        lc_state = 2.0
-                    else:
-                        lc_state = 2.0 if ki < 2 else 0.0
+                        dy_sign = float(rel[1])
+                        if abs(vyn) < cfg.vy_eps:
+                            lc_state = 1.0
+                        elif dy_sign * vyn > 0:
+                            lc_state = 2.0
+                        else:
+                            lc_state = 2.0 if ki < 2 else 0.0
 
                     dx  = float(rel[0])
                     dvx = float(rel[2])
@@ -541,6 +559,10 @@ def parse_args() -> Config:
     ap.add_argument("--t_back",   type=float, default=5.0)
     ap.add_argument("--vy_eps",   type=float, default=0.27)
     ap.add_argument("--eps_gate", type=float, default=0.1)
+    ap.add_argument("--lc_version", default="v2", choices=["v1", "v2"],
+                    help="lc_state 계산 방식: "
+                         "v1=slot기반 절대yV (tf_trajPred 방식, 값범주 {-3,-2,-1,0,1,2,3}), "
+                         "v2=dy부호+윈도우평균yV (neighformer 방식, 값범주 {0,1,2}, default)")
 
     # importance
     ap.add_argument("--importance_dl_mode", default="dy",
@@ -562,6 +584,7 @@ def parse_args() -> Config:
         t_back   = a.t_back,
         vy_eps   = a.vy_eps,
         eps_gate = a.eps_gate,
+        lc_version         = a.lc_version,
         importance_dl_mode = a.importance_dl_mode,
         dry_run     = a.dry_run,
         num_workers = a.num_workers,
