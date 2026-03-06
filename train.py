@@ -51,8 +51,11 @@ def _build_dataset(
         data_dir      = data_dir,
         split_indices = split_indices,
         stats         = stats,
-        ego_mode      = str(feat.get("ego_mode",     "pva")),
-        nb_kin_mode   = str(feat.get("nb_kin_mode",  "pva")),
+        ego_mode      = str(feat.get("ego_mode",      "pva")),
+        use_lat_off   = bool(feat.get("use_lat_off",  False)),
+        use_lc_flag   = bool(feat.get("use_lc_flag",  False)),
+        use_norm_off  = bool(feat.get("use_norm_off", False)),
+        nb_kin_mode   = str(feat.get("nb_kin_mode",   "pva")),
         use_lc_state  = bool(feat.get("use_lc_state", False)),
         use_dx_time   = bool(feat.get("use_dx_time",  False)),
         use_gate      = bool(feat.get("use_gate",     False)),
@@ -103,7 +106,8 @@ def main() -> None:
     data_hz    = float(data_cfg.get("hz", 3.0))
 
     print("\n====== Features ======")
-    for k in ("ego_mode", "nb_kin_mode", "use_lc_state", "use_dx_time",
+    for k in ("ego_mode", "use_lat_off", "use_lc_flag", "use_norm_off",
+              "nb_kin_mode", "use_lc_state", "use_dx_time",
               "use_gate", "use_I_x", "use_I_y", "use_I"):
         print(f"  {k:<18s} = {feat_cfg.get(k)}")
 
@@ -115,8 +119,11 @@ def main() -> None:
 
     # ── 4. Stats ──────────────────────────────────────────────────────────────
     stats_fname = make_stats_filename(
-        ego_mode     = str(feat_cfg.get("ego_mode",    "pva")),
-        nb_kin_mode  = str(feat_cfg.get("nb_kin_mode", "pva")),
+        ego_mode     = str(feat_cfg.get("ego_mode",     "pva")),
+        use_lat_off  = bool(feat_cfg.get("use_lat_off",  False)),
+        use_lc_flag  = bool(feat_cfg.get("use_lc_flag",  False)),
+        use_norm_off = bool(feat_cfg.get("use_norm_off", False)),
+        nb_kin_mode  = str(feat_cfg.get("nb_kin_mode",  "pva")),
         use_lc_state = bool(feat_cfg.get("use_lc_state", False)),
         use_dx_time  = bool(feat_cfg.get("use_dx_time",  False)),
         use_gate     = bool(feat_cfg.get("use_gate",     False)),
@@ -130,8 +137,11 @@ def main() -> None:
         stats_path   = stats_path,
         data_dir     = mmap_dir,
         splits_dir   = splits_dir,
-        ego_mode     = str(feat_cfg.get("ego_mode",    "pva")),
-        nb_kin_mode  = str(feat_cfg.get("nb_kin_mode", "pva")),
+        ego_mode     = str(feat_cfg.get("ego_mode",     "pva")),
+        use_lat_off  = bool(feat_cfg.get("use_lat_off",  False)),
+        use_lc_flag  = bool(feat_cfg.get("use_lc_flag",  False)),
+        use_norm_off = bool(feat_cfg.get("use_norm_off", False)),
+        nb_kin_mode  = str(feat_cfg.get("nb_kin_mode",  "pva")),
         use_lc_state = bool(feat_cfg.get("use_lc_state", False)),
         use_dx_time  = bool(feat_cfg.get("use_dx_time",  False)),
         use_gate     = bool(feat_cfg.get("use_gate",     False)),

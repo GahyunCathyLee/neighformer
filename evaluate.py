@@ -56,6 +56,9 @@ def _build_dataset(
         split_indices = split_indices,
         stats         = stats,
         ego_mode      = str(feat.get("ego_mode",      "pva")),
+        use_lat_off   = bool(feat.get("use_lat_off",  False)),
+        use_lc_flag   = bool(feat.get("use_lc_flag",  False)),
+        use_norm_off  = bool(feat.get("use_norm_off", False)),
         nb_kin_mode   = str(feat.get("nb_kin_mode",   "pva")),
         use_lc_state  = bool(feat.get("use_lc_state", False)),
         use_dx_time   = bool(feat.get("use_dx_time",  False)),
@@ -445,6 +448,9 @@ def main() -> None:
     # ── 5. Stats ──────────────────────────────────────────────────────────────
     stats_fname = make_stats_filename(
         ego_mode     = str(feat_cfg.get("ego_mode",      "pva")),
+        use_lat_off  = bool(feat_cfg.get("use_lat_off",  False)),
+        use_lc_flag  = bool(feat_cfg.get("use_lc_flag",  False)),
+        use_norm_off = bool(feat_cfg.get("use_norm_off", False)),
         nb_kin_mode  = str(feat_cfg.get("nb_kin_mode",   "pva")),
         use_lc_state = bool(feat_cfg.get("use_lc_state", False)),
         use_dx_time  = bool(feat_cfg.get("use_dx_time",  False)),

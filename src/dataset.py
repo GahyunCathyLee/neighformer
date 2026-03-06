@@ -5,7 +5,7 @@ dataset.py — PyTorch Dataset for highD mmap-preprocessed data.
 
 preprocess.py가 생성하는 파일 구조
 ────────────────────────────────────
-  x_ego.npy          (N, T, 6)      ego kinematics  [x, y, xV, yV, xA, yA]
+  x_ego.npy          (N, T, 9)      ego features  [x, y, xV, yV, xA, yA, latLaneCenterOffset, laneChange, norm_off]
   x_nb.npy           (N, T, K, 12)  neighbor features (아래 참조)
   nb_mask.npy        (N, T, K)      bool — True if neighbor exists
   y.npy              (N, Tf, 2)     future position  [x, y]
@@ -60,6 +60,11 @@ _EGO_MODE_SLICES: Dict[str, Any] = {
     "pva": slice(0, 6),   # x, y, vx, vy, ax, ay  (전체)
 }
 
+# x_ego aux feature indices (preprocess.py 정의와 동일)
+_EGO_IDX_LAT_OFF  = 6   # latLaneCenterOffset
+_EGO_IDX_LC_FLAG  = 7   # laneChange
+_EGO_IDX_NORM_OFF = 8   # norm_off
+
 # x_nb feature index constants  (preprocess.py 정의와 동일)
 # ──────────────────────────────────────────────────────────────────────────────
 _NB_IDX_KIN_END  = 6   # 0..5  kinematics
@@ -107,6 +112,9 @@ class HighDDataset(Dataset):
         "p"   → [x, y]                  ego_dim=2
         "pv"  → [x, y, vx, vy]          ego_dim=4
         "pva" → [x, y, vx, vy, ax, ay]  ego_dim=6  (default)
+    use_lat_off  : bool   x_ego index 6  latLaneCenterOffset
+    use_lc_flag  : bool   x_ego index 7  laneChange
+    use_norm_off : bool   x_ego index 8  norm_off
     nb_kin_mode : str
         "p" | "v" | "a" | "pv" | "pa" | "va" | "pva" | "none"
     use_lc_state : bool   x_nb index 6
@@ -125,6 +133,10 @@ class HighDDataset(Dataset):
         stats: Optional[Dict[str, torch.Tensor]] = None,
         # ── ego kinematics ────────────────────────────────────────────────────
         ego_mode: str = "pva",
+        # ── ego aux features ──────────────────────────────────────────────────
+        use_lat_off:  bool = False,
+        use_lc_flag:  bool = False,
+        use_norm_off: bool = False,
         # ── neighbor kinematics ───────────────────────────────────────────────
         nb_kin_mode: str = "pva",
         # ── neighbor aux features ─────────────────────────────────────────────
@@ -145,7 +157,10 @@ class HighDDataset(Dataset):
             raise ValueError(
                 f"ego_mode must be one of {sorted(_EGO_MODE_SLICES)}, got: '{ego_mode}'"
             )
-        self.ego_mode = ego_mode
+        self.ego_mode     = ego_mode
+        self.use_lat_off  = use_lat_off
+        self.use_lc_flag  = use_lc_flag
+        self.use_norm_off = use_norm_off
 
         # ── nb_kin_mode 검증 ──────────────────────────────────────────────────
         _valid_kin_modes = set(_NB_KIN_MODE_SLICES) | _NB_KIN_MODES_NONCONTIGUOUS | {"none"}
@@ -229,8 +244,17 @@ class HighDDataset(Dataset):
         real_idx = int(self.indices[idx])
 
         # ── ego history ───────────────────────────────────────────────────────
-        x_ego = torch.from_numpy(self._x_ego[real_idx].copy())     # (T, 6)
-        x_ego = x_ego[..., _EGO_MODE_SLICES[self.ego_mode]]        # (T, ego_dim)
+        raw_ego = torch.from_numpy(self._x_ego[real_idx].copy())   # (T, 9)
+        ego_parts: List[torch.Tensor] = [
+            raw_ego[..., _EGO_MODE_SLICES[self.ego_mode]]
+        ]
+        if self.use_lat_off:
+            ego_parts.append(raw_ego[..., _EGO_IDX_LAT_OFF  : _EGO_IDX_LAT_OFF  + 1])
+        if self.use_lc_flag:
+            ego_parts.append(raw_ego[..., _EGO_IDX_LC_FLAG  : _EGO_IDX_LC_FLAG  + 1])
+        if self.use_norm_off:
+            ego_parts.append(raw_ego[..., _EGO_IDX_NORM_OFF : _EGO_IDX_NORM_OFF + 1])
+        x_ego = torch.cat(ego_parts, dim=-1)                        # (T, ego_dim)
 
         # ── neighbor features ─────────────────────────────────────────────────
         raw_nb  = torch.from_numpy(self._x_nb[real_idx].copy())    # (T, K, 12)
@@ -309,7 +333,11 @@ class HighDDataset(Dataset):
 
     @property
     def ego_feature_dim(self) -> int:
-        return _EGO_MODE_SLICES[self.ego_mode].stop
+        dim = _EGO_MODE_SLICES[self.ego_mode].stop
+        if self.use_lat_off:  dim += 1
+        if self.use_lc_flag:  dim += 1
+        if self.use_norm_off: dim += 1
+        return dim
 
     @property
     def nb_feature_dim(self) -> int:
@@ -331,6 +359,18 @@ class HighDDataset(Dataset):
         return dim
 
     @property
+    def meta_rec(self):
+        return self._meta_rec
+
+    @property
+    def meta_track(self):
+        return self._meta_track
+
+    @property
+    def meta_frame(self):
+        return self._meta_frame
+
+    @property
     def feature_names(self) -> Dict[str, List[str]]:
         """
         현재 설정에서 실제 사용되는 feature 이름을 반환합니다.
@@ -341,6 +381,10 @@ class HighDDataset(Dataset):
             "pv":  ["x", "y", "vx", "vy"],
             "pva": ["x", "y", "vx", "vy", "ax", "ay"],
         }
+        ego: List[str] = list(_EGO_NAMES[self.ego_mode])
+        if self.use_lat_off:  ego.append("lat_off")
+        if self.use_lc_flag:  ego.append("lc_flag")
+        if self.use_norm_off: ego.append("norm_off")
         _KIN_NAMES = {
             "p":    ["dx", "dy"],
             "v":    ["dvx", "dvy"],
@@ -360,7 +404,7 @@ class HighDDataset(Dataset):
         if self.use_I:        nb.append("I")
 
         return {
-            "ego": _EGO_NAMES[self.ego_mode],
+            "ego": ego,
             "nb":  nb,
         }
 

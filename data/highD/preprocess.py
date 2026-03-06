@@ -9,8 +9,11 @@ stats 계산은 train.py / evaluate.py 실행 시 src/stats.py 가 자동으로 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Feature schema
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-x_ego  : (N, T, 6)
-    [x, y, xV, yV, xA, yA]
+x_ego  : (N, T, 9)
+    [x, y, xV, yV, xA, yA,
+     latLaneCenterOffset,   idx 6
+     laneChange,            idx 7
+     norm_off]              idx 8
 
 x_nb   : (N, T, K, 12)   ego-relative neighbor features
     idx  0  dx        longitudinal distance  (nb_x - ego_x)
@@ -87,7 +90,7 @@ NEIGHBOR_COLS_8 = [
     "rightFollowingId",
 ]
 
-EGO_DIM = 6    # x, y, xV, yV, xA, yA
+EGO_DIM = 9    # x, y, xV, yV, xA, yA, latLaneCenterOffset, laneChange, norm_off
 NB_DIM  = 12   # dx, dy, dvx, dvy, dax, day, lc_state, dx_time, gate, I_x, I_y, I
 K       = 8    # neighbor slots
 
@@ -345,7 +348,32 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
             exv = xv[ego_rows]; eyv = yv[ego_rows]
             exa = xa[ego_rows]; eya = ya[ego_rows]
 
-            x_ego = np.stack([ex, ey, exv, eyv, exa, eya], axis=1).astype(np.float32)
+            ego_lane_arr = lane_id[ego_rows].astype(np.int32)
+
+            # ── ego aux: latLaneCenterOffset / laneChange / norm_off ─────────
+            ego_dd_v = vid_to_dd.get(v, 0)   # 원본 주행 방향 (flip 전)
+            lat_off  = np.zeros(T, np.float32)
+            lane_w   = np.zeros(T, np.float32)
+            for ti in range(T):
+                lid = int(ego_lane_arr[ti])
+                if lid <= 0:
+                    continue
+                if ego_dd_v == 1 and len(upper_center) >= lid:
+                    lat_off[ti] = float(ey[ti] - upper_center[lid - 1])
+                    lane_w[ti]  = float(upper_width[lid - 1])
+                elif ego_dd_v == 2 and len(lower_center) >= lid:
+                    lat_off[ti] = float(ey[ti] - lower_center[lid - 1])
+                    lane_w[ti]  = float(lower_width[lid - 1])
+            half_w   = lane_w * 0.5
+            norm_off = np.zeros(T, np.float32)
+            ok       = half_w > 1e-6
+            norm_off[ok] = lat_off[ok] / half_w[ok]
+            ego_lc   = lane_change[ego_rows].astype(np.float32)
+            # ─────────────────────────────────────────────────────────────────
+
+            x_ego = np.stack(
+                [ex, ey, exv, eyv, exa, eya, lat_off, ego_lc, norm_off], axis=1
+            ).astype(np.float32)
 
             y_fut = np.stack([x[fut_rows],  y[fut_rows]],  axis=1).astype(np.float32)
             y_vel = np.stack([xv[fut_rows], yv[fut_rows]], axis=1).astype(np.float32)
@@ -353,7 +381,6 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
             x_nb      = np.zeros((T, K, NB_DIM), np.float32)
             nb_mask   = np.zeros((T, K), bool)
-            ego_lane_arr = lane_id[ego_rows].astype(np.int32)
 
             for ti, hf in enumerate(hist_frames):
                 ego_vec = np.array([ex[ti], ey[ti], exv[ti], eyv[ti], exa[ti], eya[ti]], np.float32)
