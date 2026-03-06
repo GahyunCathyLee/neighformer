@@ -276,7 +276,7 @@ def print_latency(lat: Dict[str, float], batch_size: int, warmup: int, iters: in
 def main() -> None:
     import argparse
     ap = argparse.ArgumentParser(description="Evaluate EncDecFormer checkpoint.")
-    ap.add_argument("--checkpoint",   type=str, required=True,
+    ap.add_argument("--ckpt",   type=str, required=True,
                     help="Path to .pt checkpoint file")
     ap.add_argument("--split",        type=str, default="test",
                     choices=["train", "val", "test"],
@@ -295,7 +295,7 @@ def main() -> None:
     LATENCY_ITERS  = 10_000
 
     # ── 1. Load checkpoint ────────────────────────────────────────────────────
-    ckpt_path = Path(args.checkpoint).resolve()
+    ckpt_path = Path(args.ckpt).resolve()
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
