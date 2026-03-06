@@ -5,17 +5,19 @@ evaluate.py — Evaluation entry point for EncDecFormer.
 
 Usage
 ─────
-  python evaluate.py --checkpoint ckpts/exp0/best.pt
-  python evaluate.py --checkpoint ckpts/exp0/best.pt --split test
-  python evaluate.py --checkpoint ckpts/exp0/best.pt --measure_time
+  python evaluate.py --ckpt ckpts/exp0/best.pt
+  python evaluate.py --ckpt ckpts/exp0/best.pt --split test
+  python evaluate.py --ckpt ckpts/exp0/best.pt --scenario_labels data/scenario_labels.csv
+  python evaluate.py --ckpt ckpts/exp0/best.pt --measure_time
 """
 
 from __future__ import annotations
 
 import math
 import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -26,9 +28,10 @@ from tqdm import tqdm
 from src.dataset import HighDDataset, collate_fn, load_stats
 from src.metrics import ade, fde, rmse
 from src.model import EncDecFormer, build_model
+from src.scenarios import load_scenario_labels
 from src.stats import make_stats_filename
 from src.trainer import _forward, _resolve_pred_abs
-from src.utils import resolve_path
+from src.utils import _to_int, resolve_path
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -46,6 +49,7 @@ def _build_dataset(
     split_indices: np.ndarray,
     stats,
     feat: Dict[str, Any],
+    return_meta: bool = False,
 ) -> HighDDataset:
     return HighDDataset(
         data_dir      = data_dir,
@@ -59,7 +63,7 @@ def _build_dataset(
         use_I_x       = bool(feat.get("use_I_x",      False)),
         use_I_y       = bool(feat.get("use_I_y",      False)),
         use_I         = bool(feat.get("use_I",         False)),
-        return_meta   = False,
+        return_meta   = return_meta,
     )
 
 
@@ -147,15 +151,28 @@ def measure_latency(
 # Evaluation loop
 # ──────────────────────────────────────────────────────────────────────────────
 
+# [sum_ade, sum_fde, sum_rmse, count]
+_ScenStats = Dict[str, list]
+
+
 @torch.no_grad()
 def run_evaluate(
-    model:   EncDecFormer,
-    loader:  DataLoader,
-    device:  torch.device,
-    data_hz: float,
-    use_amp: bool,
-) -> Dict[str, float]:
-    """Full evaluation pass. Returns ADE, FDE, RMSE, RMSE @1s–@5s."""
+    model:      EncDecFormer,
+    loader:     DataLoader,
+    device:     torch.device,
+    data_hz:    float,
+    use_amp:    bool,
+    labels_lut: Optional[Dict[Tuple[int, int, int], Dict[str, Any]]] = None,
+) -> Tuple[Dict[str, float], Optional[_ScenStats], Optional[_ScenStats]]:
+    """
+    Full evaluation pass.
+
+    Returns
+    -------
+    results    : overall metrics dict  (ade, fde, rmse, rmse_Xs, n_samples)
+    ev_stats   : per event_label accumulators  (or None)
+    st_stats   : per state_label accumulators  (or None)
+    """
     model.eval()
     hz = float(data_hz)
 
@@ -166,13 +183,18 @@ def run_evaluate(
     rmse_se  = {s: 0.0 for s in eval_secs}
     rmse_cnt = {s: 0   for s in eval_secs}
 
+    do_strat = labels_lut is not None
+    # [sum_ade, sum_fde, sum_rmse, count]
+    ev_stats: _ScenStats = defaultdict(lambda: [0.0, 0.0, 0.0, 0])
+    st_stats: _ScenStats = defaultdict(lambda: [0.0, 0.0, 0.0, 0])
+
     pbar = tqdm(loader, desc="Evaluating", dynamic_ncols=True, leave=True)
 
     for batch in pbar:
-        x_ego   = batch["x_ego"].to(device,   non_blocking=True)
-        x_nb    = batch["x_nb"].to(device,    non_blocking=True)
-        nb_mask = batch["nb_mask"].to(device,  non_blocking=True)
-        y_abs   = batch["y"].to(device,        non_blocking=True)
+        x_ego   = batch["x_ego"].to(device,  non_blocking=True)
+        x_nb    = batch["x_nb"].to(device,   non_blocking=True)
+        nb_mask = batch["nb_mask"].to(device, non_blocking=True)
+        y_abs   = batch["y"].to(device,       non_blocking=True)
 
         with autocast(device_type=device.type, enabled=use_amp, dtype=torch.bfloat16):
             pred, scores = _forward(model, x_ego, x_nb, nb_mask)
@@ -197,6 +219,31 @@ def run_evaluate(
         sum_rmse += rmse_s.sum().item()
         n_samples += B
 
+        # ── stratified accumulation ───────────────────────────────────────────
+        if do_strat and "meta" in batch:
+            ade_np  = ade_s.cpu().numpy()
+            fde_np  = fde_s.cpu().numpy()
+            rmse_np = rmse_s.cpu().numpy()
+
+            for i, meta in enumerate(batch["meta"]):
+                if i >= B:
+                    break
+                key = (
+                    _to_int(meta.get("recordingId")),
+                    _to_int(meta.get("trackId")),
+                    _to_int(meta.get("t0_frame")),
+                )
+                lab = labels_lut.get(key)
+                if lab is None:
+                    continue
+                ev = lab.get("event_label") or "unknown"
+                st = lab.get("state_label") or "unknown"
+                for acc, lbl in ((ev_stats, ev), (st_stats, st)):
+                    acc[lbl][0] += float(ade_np[i])
+                    acc[lbl][1] += float(fde_np[i])
+                    acc[lbl][2] += float(rmse_np[i])
+                    acc[lbl][3] += 1
+
         pbar.set_postfix(
             ADE=f"{ade_s.mean().item():.4f}",
             FDE=f"{fde_s.mean().item():.4f}",
@@ -213,7 +260,8 @@ def run_evaluate(
         results[f"rmse_{sec}s"] = (
             math.sqrt(rmse_se[sec] / rmse_cnt[sec]) if rmse_cnt[sec] > 0 else float("nan")
         )
-    return results
+
+    return results, (ev_stats if do_strat else None), (st_stats if do_strat else None)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -240,7 +288,7 @@ def print_metrics(results: Dict[str, float]) -> None:
     # ── Table 2 : RMSE @1s … @5s ─────────────────────────────────────────────
     secs  = [1, 2, 3, 4, 5]
     c2    = 9
-    inner = c2 * len(secs) + (len(secs) - 1)   # total inner width of data rows
+    inner = c2 * len(secs) + (len(secs) - 1)
     title = f"{'RMSE':^{inner}}"
 
     print()
@@ -252,6 +300,62 @@ def print_metrics(results: Dict[str, float]) -> None:
     vals = [results.get(f"rmse_{s}s", float("nan")) for s in secs]
     print("|" + "|".join(f"{v:^{c2}.4f}" for v in vals) + "|")
     print(_sep([c2] * len(secs)))
+
+
+def print_scenario_results(
+    stats: _ScenStats,
+    label_type: str,
+) -> None:
+    """
+    Print per-scenario ADE / FDE / RMSE table.
+
+    Parameters
+    ----------
+    stats      : {label: [sum_ade, sum_fde, sum_rmse, count]}
+    label_type : "Event" or "State"
+    """
+    if not stats:
+        return
+
+    # sort: known labels first (alphabetically), unknown last
+    rows = sorted(stats.items(), key=lambda x: (x[0] == "unknown", x[0]))
+
+    c_lbl = max(len(lbl) for lbl, _ in rows)
+    c_lbl = max(c_lbl, len(label_type)) + 2   # padding
+    c_n   = 9
+    c_m   = 11   # ADE / FDE / RMSE columns
+
+    ws = [c_lbl, c_n, c_m, c_m, c_m]
+
+    print(f"\n====== Scenario Results [{label_type}] ======")
+    print(_sep(ws))
+    print(
+        f"|{label_type:^{c_lbl}}|{'n':^{c_n}}"
+        f"|{'ADE':^{c_m}}|{'FDE':^{c_m}}|{'RMSE':^{c_m}}|"
+    )
+    print(_sep(ws))
+
+    total_n = sum(v[3] for v in stats.values())
+    for lbl, (sa, sf, sr, n) in rows:
+        if n == 0:
+            continue
+        print(
+            f"|{lbl:^{c_lbl}}|{n:^{c_n},}"
+            f"|{sa/n:^{c_m}.4f}|{sf/n:^{c_m}.4f}|{sr/n:^{c_m}.4f}|"
+        )
+
+    print(_sep(ws))
+
+    # total row
+    total_sa = sum(v[0] for v in stats.values())
+    total_sf = sum(v[1] for v in stats.values())
+    total_sr = sum(v[2] for v in stats.values())
+    N = max(1, total_n)
+    print(
+        f"|{'Total':^{c_lbl}}|{total_n:^{c_n},}"
+        f"|{total_sa/N:^{c_m}.4f}|{total_sf/N:^{c_m}.4f}|{total_sr/N:^{c_m}.4f}|"
+    )
+    print(_sep(ws))
 
 
 def print_latency(lat: Dict[str, float], batch_size: int, warmup: int, iters: int) -> None:
@@ -276,18 +380,20 @@ def print_latency(lat: Dict[str, float], batch_size: int, warmup: int, iters: in
 def main() -> None:
     import argparse
     ap = argparse.ArgumentParser(description="Evaluate EncDecFormer checkpoint.")
-    ap.add_argument("--ckpt",   type=str, required=True,
+    ap.add_argument("--ckpt",             type=str, required=True,
                     help="Path to .pt checkpoint file")
-    ap.add_argument("--split",        type=str, default="test",
+    ap.add_argument("--split",            type=str, default="test",
                     choices=["train", "val", "test"],
                     help="Dataset split to evaluate on  (default: test)")
-    ap.add_argument("--batch_size",   type=int, default=None,
+    ap.add_argument("--scenario_labels",  type=str, default=None,
+                    help="Path to scenario_labels.csv for per-scenario breakdown")
+    ap.add_argument("--batch_size",       type=int, default=None,
                     help="Override batch size from saved config")
-    ap.add_argument("--num_workers",  type=int, default=None,
+    ap.add_argument("--num_workers",      type=int, default=None,
                     help="Override num_workers from saved config")
-    ap.add_argument("--device",       type=str, default=None,
+    ap.add_argument("--device",           type=str, default=None,
                     help="Override device  (cuda / cpu)")
-    ap.add_argument("--measure_time", action="store_true",
+    ap.add_argument("--measure_time",     action="store_true",
                     help="Measure inference latency (1,000 warmup + 10,000 iters)")
     args = ap.parse_args()
 
@@ -327,7 +433,15 @@ def main() -> None:
     data_hz    = float(data_cfg.get("hz", 3.0))
     use_amp    = bool(train_cfg.get("use_amp", True)) and (device.type == "cuda")
 
-    # ── 4. Stats ──────────────────────────────────────────────────────────────
+    # ── 4. Scenario labels (optional) ─────────────────────────────────────────
+    # Priority: --scenario_labels arg > cfg["data"]["scenario_labels"] > None
+    labels_lut = None
+    if not args.measure_time:
+        labels_path = args.scenario_labels or data_cfg.get("scenario_labels", None)
+        if labels_path:
+            labels_lut = load_scenario_labels(resolve_path(labels_path))
+
+    # ── 5. Stats ──────────────────────────────────────────────────────────────
     stats_fname = make_stats_filename(
         ego_mode     = str(feat_cfg.get("ego_mode",      "pva")),
         nb_kin_mode  = str(feat_cfg.get("nb_kin_mode",   "pva")),
@@ -340,13 +454,14 @@ def main() -> None:
     )
     stats = load_stats(stats_dir / stats_fname)
 
-    # ── 5. Dataset & DataLoader ───────────────────────────────────────────────
+    # ── 6. Dataset & DataLoader ───────────────────────────────────────────────
     split_file = splits_dir / f"{args.split}_indices.npy"
     if not split_file.exists():
         raise FileNotFoundError(f"Split index file not found: {split_file}")
     split_idx = np.load(split_file)
 
-    ds = _build_dataset(mmap_dir, split_idx, stats, feat_cfg)
+    need_meta = labels_lut is not None
+    ds = _build_dataset(mmap_dir, split_idx, stats, feat_cfg, return_meta=need_meta)
     print(f"[INFO] Dataset    : {args.split} split  n={len(ds):,}  {ds}")
 
     batch_size  = args.batch_size if args.batch_size is not None \
@@ -369,7 +484,7 @@ def main() -> None:
             persistent_workers  = num_workers > 0,
         )
 
-    # ── 6. Model ──────────────────────────────────────────────────────────────
+    # ── 7. Model ──────────────────────────────────────────────────────────────
     model: EncDecFormer = build_model(
         cfg,
         ego_dim = ds.ego_feature_dim,
@@ -379,7 +494,7 @@ def main() -> None:
     model.eval()
     print(f"[INFO] Model      : params={sum(p.numel() for p in model.parameters()):,}")
 
-    # ── 7a. Latency mode ──────────────────────────────────────────────────────
+    # ── 8a. Latency mode ──────────────────────────────────────────────────────
     if args.measure_time:
         print_device_info(device)
 
@@ -398,15 +513,22 @@ def main() -> None:
 
         print(f"\n====== Inference Latency ======")
         lat = measure_latency(_infer, device, warmup=LATENCY_WARMUP, iters=LATENCY_ITERS)
-        print_latency(lat, batch_size=1,
-                      warmup=LATENCY_WARMUP, iters=LATENCY_ITERS)
+        print_latency(lat, batch_size=1, warmup=LATENCY_WARMUP, iters=LATENCY_ITERS)
 
-    # ── 7b. Metric evaluation mode ────────────────────────────────────────────
+    # ── 8b. Metric evaluation mode ────────────────────────────────────────────
     else:
         print(f"\n====== Evaluation  [{args.split}] ======")
-        results = run_evaluate(model, loader, device, data_hz, use_amp)
+        results, ev_stats, st_stats = run_evaluate(
+            model, loader, device, data_hz, use_amp, labels_lut
+        )
+
         print(f"\n  n_samples = {int(results['n_samples']):,}")
         print_metrics(results)
+
+        if ev_stats:
+            print_scenario_results(ev_stats, label_type="Event")
+        if st_stats:
+            print_scenario_results(st_stats, label_type="State")
 
     print()
 
