@@ -9,4 +9,3 @@ tensorboard/
 __pycache__/
 
 run_trains.sh
-*.yaml
