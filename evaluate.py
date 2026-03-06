@@ -385,8 +385,8 @@ def main() -> None:
     ap.add_argument("--split",            type=str, default="test",
                     choices=["train", "val", "test"],
                     help="Dataset split to evaluate on  (default: test)")
-    ap.add_argument("--scenario_labels",  type=str, default=None,
-                    help="Path to scenario_labels.csv for per-scenario breakdown")
+    ap.add_argument("--scenario",         action="store_true",
+                    help="Enable per-scenario breakdown (reads path from checkpoint cfg)")
     ap.add_argument("--batch_size",       type=int, default=None,
                     help="Override batch size from saved config")
     ap.add_argument("--num_workers",      type=int, default=None,
@@ -434,12 +434,13 @@ def main() -> None:
     use_amp    = bool(train_cfg.get("use_amp", True)) and (device.type == "cuda")
 
     # ── 4. Scenario labels (optional) ─────────────────────────────────────────
-    # Priority: --scenario_labels arg > cfg["data"]["scenario_labels"] > None
     labels_lut = None
-    if not args.measure_time:
-        labels_path = args.scenario_labels or data_cfg.get("scenario_labels", None)
+    if args.scenario and not args.measure_time:
+        labels_path = data_cfg.get("scenario_labels", None)
         if labels_path:
             labels_lut = load_scenario_labels(resolve_path(labels_path))
+        else:
+            print("[WARN] --scenario: cfg has no data.scenario_labels → skipping")
 
     # ── 5. Stats ──────────────────────────────────────────────────────────────
     stats_fname = make_stats_filename(
