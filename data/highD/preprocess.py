@@ -24,7 +24,7 @@ x_nb   : (N, T, K, 12)   ego-relative neighbor features
     idx  5  day       relative lateral acceleration
     idx  6  lc_state  lane-change state  {0: closing in, 1: stay, 2: moving out}
     idx  7  dx_time   dx / (dvx +- eps)
-    idx  8  gate      1 if -t_back < dx_time < t_front else 0
+    idx  8  gate      1 if (I_x >= theta_x) OR (I_y >= theta_y) else 0  [theta = P85]
     idx  9  I_x       longitudinal importance
     idx 10  I_y       lateral importance
     idx 11  I         composite importance  sqrt(I_x * I_y)
@@ -39,19 +39,26 @@ meta_recordingId / trackId / t0_frame : (N,)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Importance formula
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    I_x = exp(-(dx_time^2 / (2*sx^2)) - ax * d_val^2)
-    I_y = exp(-(d_val^2   / (2*sy^2)) - ay * |dx_time|^1.5)
+    I_x = exp(-(dx_time^2 / (2*sx^2)) - ax * delta_lane^2)
+    I_y = exp(-(lc_state^2 / (2*sigma^2)) - alpha * |dx_time|^1.5)
     I   = sqrt(I_x * I_y)
 
-    d_val mode (--importance_dl_mode):
-        "dy"       ->  d_val = nb_y - ego_y              (continuous, default)
-        "lane_id"  ->  d_val = |nb_lane_id - ego_lane_id|
-        "lc_state" ->  d_val = lc_state  {0, 1, 2}
+    I_x: longitudinal importance
+        dx_time = dx / (dvx +- eps)   eps=1.0
+        sx=3.0, ax=0.5
+        delta_lane = |nb_lane_id - ego_lane_id|  in {0, 1, 2, ...}
 
-    Default params per mode:
-        dy:       sx=5.0, ax=0.2, sy=5.0,  ay=0.1
-        lane_id:  sx=5.0, ax=0.8, sy=1.25, ay=0.1
-        lc_state: sx=5.0, ax=0.5, sy=2.0,  ay=0.1
+    I_y: lateral importance  (always uses lc_state as d_val)
+        lc_state: {0: closing in, 1: stay, 2: moving out}
+        sigma=1.0  ->  I_y(stay=1)=0.61, I_y(moving_out=2)=0.14
+        alpha=0.01 ->  I_y(dx_time=5s) *= 0.84  (lc_state-dominant)
+
+    gate_mode='or':     gate = 1  if  (I_x >= theta_x) OR (I_y >= theta_y)
+    gate_mode='single': gate = 1  if  I >= theta  (I = sqrt(I_x * I_y))
+        theta_x, theta_y, theta = P85 of respective distribution over dataset
+
+    gate_apply='feature': store gate as 0.0/1.0 in x_nb[:,:,:,8]  (default)
+    gate_apply='mask':    gate=0 neighbor -> nb_mask set to False (treated as absent)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Usage
@@ -125,7 +132,14 @@ class Config:
     t_front:  float = 3.0
     t_back:   float = 5.0
     vy_eps:   float = 0.27
-    eps_gate: float = 0.1
+    eps_gate: float = 1.0   # raised from 0.1: improves dx sensitivity over dvx
+
+    # importance gate (set thresholds after first mmap pass)
+    gate_mode:    str   = 'or'      # 'or' = (I_x>=theta_x OR I_y>=theta_y) | 'single' = I>=theta
+    gate_apply:   str   = 'feature' # 'feature' = store 0/1 in x_nb | 'mask' = gate=0 -> nb_mask=False
+    gate_theta_x: float = 0.0       # I_x threshold (or-mode); 0.0 = legacy time-window gate
+    gate_theta_y: float = 0.0       # I_y threshold (or-mode)
+    gate_theta:   float = 0.0       # I  threshold (single-mode)
 
     # lc_state version
     lc_version: str = "v2"           # "v1" (slot-based, tf_trajPred) | "v2" (dy-sign-based, neighformer)
@@ -138,11 +152,13 @@ class Config:
     num_workers: int  = 0   # 0 = os.cpu_count()
 
 
-# Per-mode default importance parameters: {sx, ax, sy, ay}
+# Importance parameters
+# I_x: exp(-(dx_time^2/2sx^2) - ax*dy^2)
+# I_y: exp(-(lc_state^2/2sigma^2) - alpha*|dx_time|^1.5)   [always lc_state-based]
 IMPORTANCE_PARAMS: Dict[str, Dict[str, float]] = {
-    "dy":       {"sx": 5.0, "ax": 0.2, "sy": 5.0,  "ay": 0.1},
-    "lane_id":  {"sx": 5.0, "ax": 0.8, "sy": 1.25, "ay": 0.1},
-    "lc_state": {"sx": 5.0, "ax": 0.5, "sy": 2.0,  "ay": 0.1},
+    "dy":       {"sx": 3.0, "ax": 0.28, "sigma": 1.0, "alpha": 0.01},
+    "lane_id":  {"sx": 3.0, "ax": 0.28, "sigma": 1.0, "alpha": 0.01},
+    "lc_state": {"sx": 3.0, "ax": 0.28, "sigma": 1.0, "alpha": 0.01},
 }
 
 
@@ -165,17 +181,25 @@ def _safe_float(x: np.ndarray, default: float = 0.0) -> np.ndarray:
 
 def compute_importance(
     dx_time: float,
-    d_val: float,
+    delta_lane: float,
+    lc_state: float,
     mode: str,
 ) -> Tuple[float, float, float]:
+    """
+    I_x = exp(-(dx_time^2 / 2*sx^2) - ax * delta_lane^2)
+        delta_lane = |nb_lane_id - ego_lane_id|
+    I_y = exp(-(lc_state^2 / 2*sigma^2) - alpha * |dx_time|^1.5)
+        lc_state: {0: closing in -> highest I_y, 1: stay, 2: moving out -> lowest}
+    I   = sqrt(I_x * I_y)
+    """
     p  = IMPORTANCE_PARAMS[mode]
     ix = float(np.exp(
         -(dx_time ** 2) / (2.0 * p["sx"] ** 2)
-        - p["ax"] * d_val ** 2
+        - p["ax"] * delta_lane ** 2
     ))
     iy = float(np.exp(
-        -(d_val ** 2) / (2.0 * p["sy"] ** 2)
-        - p["ay"] * (abs(dx_time) ** 1.5)
+        -(lc_state ** 2) / (2.0 * p["sigma"] ** 2)
+        - p["alpha"] * (abs(dx_time) ** 1.5)
     ))
     i_total = float(np.sqrt(ix * iy))
     return ix, iy, i_total
@@ -432,24 +456,38 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
                     dx  = float(rel[0])
                     dvx = float(rel[2])
-                    dx_time = dx / (dvx + (cfg.eps_gate if dvx >= 0 else -cfg.eps_gate))
-                    gate    = 1.0 if (-cfg.t_back < dx_time < cfg.t_front) else 0.0
+                    # eps_gate raised to 1.0: keeps dx dominant over dvx in dx_time
+                    dx_time    = dx / (dvx + (cfg.eps_gate if dvx >= 0 else -cfg.eps_gate))
+                    delta_lane = float(abs(int(lane_id[r]) - int(ego_lane_arr[ti])))
 
-                    if cfg.importance_dl_mode == "lane_id":
-                        d_val = float(abs(int(lane_id[r]) - int(ego_lane_arr[ti])))
-                    elif cfg.importance_dl_mode == "lc_state":
-                        d_val = lc_state
+                    ix, iy, i_total = compute_importance(
+                        dx_time, delta_lane, lc_state, cfg.importance_dl_mode
+                    )
+
+                    # gate: importance-based
+                    if cfg.gate_mode == 'single' and cfg.gate_theta > 0.0:
+                        gate = 1.0 if i_total >= cfg.gate_theta else 0.0
+                    elif cfg.gate_mode == 'or' and cfg.gate_theta_x > 0.0 and cfg.gate_theta_y > 0.0:
+                        gate = 1.0 if (ix >= cfg.gate_theta_x or iy >= cfg.gate_theta_y) else 0.0
                     else:
-                        d_val = float(rel[1])
-
-                    ix, iy, i_total = compute_importance(dx_time, d_val, cfg.importance_dl_mode)
+                        # fallback: legacy time-window gate (use until thresholds are calibrated)
+                        gate = 1.0 if (-cfg.t_back < dx_time < cfg.t_front) else 0.0
 
                     x_nb[ti, ki, 6]  = lc_state
                     x_nb[ti, ki, 7]  = dx_time
-                    x_nb[ti, ki, 8]  = gate
                     x_nb[ti, ki, 9]  = ix
                     x_nb[ti, ki, 10] = iy
                     x_nb[ti, ki, 11] = i_total
+
+                    if cfg.gate_apply == 'mask':
+                        # gate=0: treat neighbor as absent
+                        if gate == 0.0:
+                            nb_mask[ti, ki]  = False
+                            x_nb[ti, ki, :]  = 0.0
+                        x_nb[ti, ki, 8] = 1.0   # all remaining are gate=1
+                    else:
+                        # 'feature': store raw gate value (default)
+                        x_nb[ti, ki, 8] = gate
 
             x_ego_list.append(x_ego)
             y_fut_list.append(y_fut)
@@ -585,7 +623,18 @@ def parse_args() -> Config:
     ap.add_argument("--t_front",  type=float, default=3.0)
     ap.add_argument("--t_back",   type=float, default=5.0)
     ap.add_argument("--vy_eps",   type=float, default=0.27)
-    ap.add_argument("--eps_gate", type=float, default=0.1)
+    ap.add_argument("--eps_gate",      type=float, default=1.0,
+                    help="eps for dx_time denominator clamp (raised to 1.0)")
+    ap.add_argument("--gate_mode",     default="or", choices=["or", "single"],
+                    help="or: (I_x>=theta_x OR I_y>=theta_y) | single: I>=theta")
+    ap.add_argument("--gate_apply",    default="feature", choices=["feature", "mask"],
+                    help="feature: store gate 0/1 in x_nb | mask: gate=0 removes neighbor")
+    ap.add_argument("--gate_theta_x",  type=float, default=0.0,
+                    help="I_x threshold for or-mode (P85). 0.0 = legacy gate")
+    ap.add_argument("--gate_theta_y",  type=float, default=0.0,
+                    help="I_y threshold for or-mode (P85). 0.0 = legacy gate")
+    ap.add_argument("--gate_theta",    type=float, default=0.0,
+                    help="I threshold for single-mode (P85). 0.0 = legacy gate")
     ap.add_argument("--lc_version", default="v2", choices=["v1", "v2"],
                     help="lc_state 계산 방식: "
                          "v1=slot기반 절대yV (tf_trajPred 방식, 값범주 {-3,-2,-1,0,1,2,3}), "
@@ -610,8 +659,13 @@ def parse_args() -> Config:
         t_front  = a.t_front,
         t_back   = a.t_back,
         vy_eps   = a.vy_eps,
-        eps_gate = a.eps_gate,
-        lc_version         = a.lc_version,
+        eps_gate      = a.eps_gate,
+        gate_mode     = a.gate_mode,
+        gate_apply    = a.gate_apply,
+        gate_theta_x  = a.gate_theta_x,
+        gate_theta_y  = a.gate_theta_y,
+        gate_theta    = a.gate_theta,
+        lc_version    = a.lc_version,
         importance_dl_mode = a.importance_dl_mode,
         dry_run     = a.dry_run,
         num_workers = a.num_workers,
