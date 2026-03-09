@@ -27,7 +27,7 @@ x_nb   : (N, T, K, 12)   ego-relative neighbor features
     idx  8  gate      1 if (I_x >= theta_x) OR (I_y >= theta_y) else 0  [theta = P85]
     idx  9  I_x       longitudinal importance
     idx 10  I_y       lateral importance
-    idx 11  I         composite importance  sqrt(I_x * I_y)
+    idx 11  I         composite importance  sqrt((I_x^2 + I_y^2) / 2)
 
 y          : (N, Tf, 2)     future [x, y]
 y_vel      : (N, Tf, 2)     future [xV, yV]
@@ -39,22 +39,21 @@ meta_recordingId / trackId / t0_frame : (N,)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Importance formula
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    I_x = exp(-(dx_time^2 / (2*sx^2)) - ax * delta_lane^2)
-    I_y = exp(-(lc_state^2 / (2*sigma^2)) - alpha * |dx_time|^1.5)
-    I   = sqrt(I_x * I_y)
+    I_x = exp(-(dx_time^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+    I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |dx_time|^1.5) * exp(-by * delta_lane)
+    I   = sqrt((I_x^2 + I_y^2) / 2)
 
     I_x: longitudinal importance
         dx_time = dx / (dvx +- eps)   eps=1.0
-        sx=3.0, ax=0.5
+        sx=15.0, ax=0.2, bx=0.25
         delta_lane = |nb_lane_id - ego_lane_id|  in {0, 1, 2, ...}
 
-    I_y: lateral importance  (always uses lc_state as d_val)
+    I_y: lateral importance
         lc_state: {0: closing in, 1: stay, 2: moving out}
-        sigma=1.0  ->  I_y(stay=1)=0.61, I_y(moving_out=2)=0.14
-        alpha=0.01 ->  I_y(dx_time=5s) *= 0.84  (lc_state-dominant)
+        sy=2.0, ay=0.01, by=0.1
 
     gate_mode='or':     gate = 1  if  (I_x >= theta_x) OR (I_y >= theta_y)
-    gate_mode='single': gate = 1  if  I >= theta  (I = sqrt(I_x * I_y))
+    gate_mode='single': gate = 1  if  I >= theta  (I = sqrt((I_x^2 + I_y^2) / 2))
         theta_x, theta_y, theta = P85 of respective distribution over dataset
 
     gate_apply='feature'  : store gate as 0.0/1.0 in x_nb[:,:,:,8]  (default)
@@ -155,12 +154,13 @@ class Config:
 
 
 # Importance parameters
-# I_x: exp(-(dx_time^2/2sx^2) - ax*dy^2)
-# I_y: exp(-(lc_state^2/2sigma^2) - alpha*|dx_time|^1.5)   [always lc_state-based]
+# I_x: exp(-(dx_time^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+# I_y: exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |dx_time|^1.5) * exp(-by * delta_lane)
+# I  : sqrt((I_x^2 + I_y^2) / 2)
 IMPORTANCE_PARAMS: Dict[str, Dict[str, float]] = {
-    "dy":       {"sx": 3.0, "ax": 0.28, "sigma": 1.0, "alpha": 0.01},
-    "lane_id":  {"sx": 3.0, "ax": 0.28, "sigma": 1.0, "alpha": 0.01},
-    "lc_state": {"sx": 3.0, "ax": 0.28, "sigma": 1.0, "alpha": 0.01},
+    "dy":       {"sx": 15.0, "ax": 0.2, "bx": 0.25, "sy": 2.0, "ay": 0.01, "by": 0.1},
+    "lane_id":  {"sx": 15.0, "ax": 0.2, "bx": 0.25, "sy": 2.0, "ay": 0.01, "by": 0.1},
+    "lc_state": {"sx": 15.0, "ax": 0.2, "bx": 0.25, "sy": 2.0, "ay": 0.01, "by": 0.1},
 }
 
 
@@ -188,22 +188,21 @@ def compute_importance(
     mode: str,
 ) -> Tuple[float, float, float]:
     """
-    I_x = exp(-(dx_time^2 / 2*sx^2) - ax * delta_lane^2)
-        delta_lane = |nb_lane_id - ego_lane_id|
-    I_y = exp(-(lc_state^2 / 2*sigma^2) - alpha * |dx_time|^1.5)
-        lc_state: {0: closing in -> highest I_y, 1: stay, 2: moving out -> lowest}
-    I   = sqrt(I_x * I_y)
+    I_x = exp(-(dx_time^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+        dx_time    = dx / (dvx +- eps)
+        delta_lane = |nb_lane_id - ego_lane_id|  in {0, 1, 2, ...}
+        lc_state:  {0: closing in, 1: stay, 2: moving out}
+    I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |dx_time|^1.5) * exp(-by * delta_lane)
+    I   = sqrt((I_x^2 + I_y^2) / 2)
     """
     p  = IMPORTANCE_PARAMS[mode]
-    ix = float(np.exp(
-        -(dx_time ** 2) / (2.0 * p["sx"] ** 2)
-        - p["ax"] * delta_lane ** 2
-    ))
-    iy = float(np.exp(
-        -(lc_state ** 2) / (2.0 * p["sigma"] ** 2)
-        - p["alpha"] * (abs(dx_time) ** 1.5)
-    ))
-    i_total = float(np.sqrt(ix * iy))
+    ix = float(np.exp(-(dx_time ** 2) / (2.0 * p["sx"] ** 2))
+               * np.exp(-p["ax"] * lc_state)
+               * np.exp(-p["bx"] * delta_lane))
+    iy = float(np.exp(-(lc_state ** 2) / (2.0 * p["sy"] ** 2))
+               * np.exp(-p["ay"] * (abs(dx_time) ** 1.5))
+               * np.exp(-p["by"] * delta_lane))
+    i_total = float(np.sqrt((ix ** 2 + iy ** 2) / 2.0))
     return ix, iy, i_total
 
 
@@ -477,6 +476,8 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
                     x_nb[ti, ki, 6]  = lc_state
                     x_nb[ti, ki, 7]  = dx_time
+                    i_total *= gate   # gate as activation: I=0 if gate=0, I unchanged if gate=1
+
                     x_nb[ti, ki, 9]  = ix
                     x_nb[ti, ki, 10] = iy
                     x_nb[ti, ki, 11] = i_total
@@ -508,6 +509,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                         continue
                     if np.all(gates_ki == 0.0):
                         nb_mask[:, ki] = False
+                        x_nb[:, ki, :] = 0.0
                     # else: keep as-is (partial gate info in x_nb[:,ki,8])
 
             x_ego_list.append(x_ego)
@@ -635,7 +637,7 @@ def parse_args() -> Config:
 
     # recording
     ap.add_argument("--target_hz",          type=float, default=3.0)
-    ap.add_argument("--history_sec",        type=float, default=2.0)
+    ap.add_argument("--history_sec",        type=float, default=3.0)
     ap.add_argument("--future_sec",         type=float, default=5.0)
     ap.add_argument("--stride_sec",         type=float, default=1.0)
     ap.add_argument("--normalize_upper_xy", action="store_true", default=True)
@@ -646,7 +648,7 @@ def parse_args() -> Config:
     ap.add_argument("--vy_eps",   type=float, default=0.27)
     ap.add_argument("--eps_gate",      type=float, default=1.0,
                     help="eps for dx_time denominator clamp (raised to 1.0)")
-    ap.add_argument("--gate_mode",     default="or", choices=["or", "single"],
+    ap.add_argument("--gate_mode",     default="single", choices=["or", "single"],
                     help="or: (I_x>=theta_x OR I_y>=theta_y) | single: I>=theta")
     ap.add_argument("--gate_apply",    default="feature",
                     choices=["feature", "mask", "ghost", "mask_all"],
