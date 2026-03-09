@@ -57,8 +57,10 @@ Importance formula
     gate_mode='single': gate = 1  if  I >= theta  (I = sqrt(I_x * I_y))
         theta_x, theta_y, theta = P85 of respective distribution over dataset
 
-    gate_apply='feature': store gate as 0.0/1.0 in x_nb[:,:,:,8]  (default)
-    gate_apply='mask':    gate=0 neighbor -> nb_mask set to False (treated as absent)
+    gate_apply='feature'  : store gate as 0.0/1.0 in x_nb[:,:,:,8]  (default)
+    gate_apply='mask'     : gate=0 at t -> nb_mask[t,k]=False only (x_nb values kept)
+    gate_apply='ghost'    : nb_mask unchanged, gate=0 -> x_nb[t,k]=99999 (sentinel)
+    gate_apply='mask_all' : gate=0 for ALL t -> nb_mask[:,k]=False + x_nb[:,k]=0
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Usage
@@ -136,7 +138,7 @@ class Config:
 
     # importance gate (set thresholds after first mmap pass)
     gate_mode:    str   = 'or'      # 'or' = (I_x>=theta_x OR I_y>=theta_y) | 'single' = I>=theta
-    gate_apply:   str   = 'feature' # 'feature' = store 0/1 in x_nb | 'mask' = gate=0 -> nb_mask=False
+    gate_apply:   str   = 'feature' # 'feature' | 'mask' | 'ghost' | 'mask_all'
     gate_theta_x: float = 0.0       # I_x threshold (or-mode); 0.0 = legacy time-window gate
     gate_theta_y: float = 0.0       # I_y threshold (or-mode)
     gate_theta:   float = 0.0       # I  threshold (single-mode)
@@ -480,14 +482,33 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     x_nb[ti, ki, 11] = i_total
 
                     if cfg.gate_apply == 'mask':
-                        # gate=0: treat neighbor as absent
+                        # per-timestep: nb_mask=False only, x_nb values kept
                         if gate == 0.0:
-                            nb_mask[ti, ki]  = False
-                            x_nb[ti, ki, :]  = 0.0
-                        x_nb[ti, ki, 8] = 1.0   # all remaining are gate=1
+                            nb_mask[ti, ki] = False
+                        x_nb[ti, ki, 8] = gate
+                    elif cfg.gate_apply == 'ghost':
+                        # nb_mask unchanged; gate=0 -> sentinel value
+                        if gate == 0.0:
+                            x_nb[ti, ki, :] = 99999.0
+                            x_nb[ti, ki, 8] = 0.0
+                        else:
+                            x_nb[ti, ki, 8] = 1.0
+                    elif cfg.gate_apply == 'mask_all':
+                        # accumulate gate; post-process after all timesteps
+                        x_nb[ti, ki, 8] = gate
                     else:
                         # 'feature': store raw gate value (default)
                         x_nb[ti, ki, 8] = gate
+
+            # post-process: mask_all — gate=0 for ALL t -> mask entire neighbor
+            if cfg.gate_apply == 'mask_all':
+                for ki in range(K):
+                    gates_ki = x_nb[:, ki, 8]          # (T,) accumulated gate values
+                    if not np.any(nb_mask[:, ki]):
+                        continue
+                    if np.all(gates_ki == 0.0):
+                        nb_mask[:, ki] = False
+                    # else: keep as-is (partial gate info in x_nb[:,ki,8])
 
             x_ego_list.append(x_ego)
             y_fut_list.append(y_fut)
@@ -627,8 +648,14 @@ def parse_args() -> Config:
                     help="eps for dx_time denominator clamp (raised to 1.0)")
     ap.add_argument("--gate_mode",     default="or", choices=["or", "single"],
                     help="or: (I_x>=theta_x OR I_y>=theta_y) | single: I>=theta")
-    ap.add_argument("--gate_apply",    default="feature", choices=["feature", "mask"],
-                    help="feature: store gate 0/1 in x_nb | mask: gate=0 removes neighbor")
+    ap.add_argument("--gate_apply",    default="feature",
+                    choices=["feature", "mask", "ghost", "mask_all"],
+                    help=(
+                        "feature: gate as 0/1 feature (default) | "
+                        "mask: gate=0 at t -> nb_mask=False only | "
+                        "ghost: gate=0 -> x_nb=99999 sentinel | "
+                        "mask_all: all-t gate=0 -> nb_mask=False + x_nb=0"
+                    ))
     ap.add_argument("--gate_theta_x",  type=float, default=0.0,
                     help="I_x threshold for or-mode (P85). 0.0 = legacy gate")
     ap.add_argument("--gate_theta_y",  type=float, default=0.0,
