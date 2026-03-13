@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-highd_pipeline.py  —  HighD preprocessing pipeline  (raw CSV → mmap)
+preprocess.py  —  HighD preprocessing pipeline  (raw CSV → mmap)
 
 STAGE raw2mmap :  highD raw CSV  →  memory-mapped arrays
 
 stats 계산은 train.py / evaluate.py 실행 시 src/stats.py 가 자동으로 수행합니다.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Feature schema
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-x_ego  : (N, T, 9)
-    [x, y, xV, yV, xA, yA,
-     latLaneCenterOffset,   idx 6
-     laneChange,            idx 7
-     norm_off]              idx 8
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+x_ego  : (N, T, 6)
+    [x, y, xV, yV, xA, yA]
 
-x_nb   : (N, T, K, 12)   ego-relative neighbor features
+x_nb   : (N, T, K, 13)   ego-relative neighbor features
     idx  0  dx        longitudinal distance  (nb_x - ego_x)
     idx  1  dy        lateral distance       (nb_y - ego_y)
     idx  2  dvx       relative longitudinal velocity
@@ -23,11 +20,12 @@ x_nb   : (N, T, K, 12)   ego-relative neighbor features
     idx  4  dax       relative longitudinal acceleration
     idx  5  day       relative lateral acceleration
     idx  6  lc_state  lane-change state  {0: closing in, 1: stay, 2: moving out}
-    idx  7  dx_time   dx / (dvx +- eps)
-    idx  8  gate      1 if (I_x >= theta_x) OR (I_y >= theta_y) else 0  [theta = P85]
-    idx  9  I_x       longitudinal importance
-    idx 10  I_y       lateral importance
-    idx 11  I         composite importance  sqrt((I_x^2 + I_y^2) / 2)
+    idx  7  lit       Longitudinal Interaction Time  dx / (dvx ± eps)
+    idx  8  lis       Longitudinal Interaction State (binned lit)
+    idx  9  gate      1 if (I_x >= theta_x) OR (I_y >= theta_y) else 0  [theta = P85]
+    idx 10  I_x       longitudinal importance
+    idx 11  I_y       lateral importance
+    idx 12  I         composite importance  sqrt((I_x^2 + I_y^2) / 2)
 
 y          : (N, Tf, 2)     future [x, y]
 y_vel      : (N, Tf, 2)     future [xV, yV]
@@ -36,42 +34,40 @@ nb_mask    : (N, T, K)      bool - True if neighbor exists
 x_last_abs : (N, 2)         last absolute (x, y) of ego history
 meta_recordingId / trackId / t0_frame : (N,)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LIS (Longitudinal Interaction State) modes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    '3'    : {-1, 0, 1}       lit 3-bin   [-inf, -7.5696, 6.4434, inf]
+    '5'    : {-2,-1,0,1,2}    lit 5-bin   [-inf,-16.3463,-4.3708,3.4246,15.5837,inf]
+    'abs3' : {0, 1, 2}        |lit| 3-bin [0, 7.0097, 19.1421, inf]
+    'abs5' : {0, 1, 2, 3, 4}  |lit| 5-bin [0, 3.8898, 8.8855, 15.9786, 28.3202, inf]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Importance formula
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    I_x = exp(-(dx_time^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
-    I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |dx_time|^1.5) * exp(-by * delta_lane)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    I_x = exp(-(lit^2 / (2*sx^2))) * exp(-ax * lis) * exp(-bx * delta_lane)
+    I_y = exp(-(lis^2 / (2*sy^2))) * exp(-ay * |lit|^1.5) * exp(-by * delta_lane)
     I   = sqrt((I_x^2 + I_y^2) / 2)
 
-    I_x: longitudinal importance
-        dx_time = dx / (dvx +- eps)   eps=1.0
-        sx=15.0, ax=0.2, bx=0.25
-        delta_lane = |nb_lane_id - ego_lane_id|  in {0, 1, 2, ...}
+    lit: Longitudinal Interaction Time = dx / (dvx ± eps)   eps=1.0
+    lis: Longitudinal Interaction State (discrete, LIS_BINS[lis_mode])
+    delta_lane = |nb_lane_id - ego_lane_id|  in {0, 1, 2, ...}
 
-    I_y: lateral importance
-        lc_state: {0: closing in, 1: stay, 2: moving out}
-        sy=2.0, ay=0.01, by=0.1
+    Params per lis_mode:
+        'abs3': sx=1.0, ax=0.15, bx=0.2, sy=2.0, ay=0.2,  by=0.125
+        'abs5': sx=2.0, ax=0.15, bx=0.2, sy=2.0, ay=0.1,  by=0.1
+        '5':    sx=1.0, ax=0.15, bx=0.2, sy=2.0, ay=0.1,  by=0.1
+        '3':    sx=0.5, ax=0.15, bx=0.2, sy=2.0, ay=0.2,  by=0.1
 
     gate_mode='or':     gate = 1  if  (I_x >= theta_x) OR (I_y >= theta_y)
     gate_mode='single': gate = 1  if  I >= theta  (I = sqrt((I_x^2 + I_y^2) / 2))
         theta_x, theta_y, theta = P85 of respective distribution over dataset
-
-    gate_apply='feature'  : store gate as 0.0/1.0 in x_nb[:,:,:,8]  (default)
-    gate_apply='mask'     : gate=0 at t -> nb_mask[t,k]=False only (x_nb values kept)
-    gate_apply='ghost'    : nb_mask unchanged, gate=0 -> x_nb[t,k]=99999 (sentinel)
-    gate_apply='mask_all' : gate=0 for ALL t -> nb_mask[:,k]=False + x_nb[:,k]=0
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Usage
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  python highd_pipeline.py \\
-      --raw_dir  data/highD/raw \\
-      --mmap_dir data/highD/mmap
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import concurrent.futures
 import re
 from dataclasses import dataclass
@@ -98,9 +94,51 @@ NEIGHBOR_COLS_8 = [
     "rightFollowingId",
 ]
 
-EGO_DIM = 9    # x, y, xV, yV, xA, yA, latLaneCenterOffset, laneChange, norm_off
-NB_DIM  = 12   # dx, dy, dvx, dvy, dax, day, lc_state, dx_time, gate, I_x, I_y, I
+EGO_DIM = 6    # x, y, xV, yV, xA, yA
+NB_DIM  = 13   # dx, dy, dvx, dvy, dax, day, lc_state, lit, lis, gate, I_x, I_y, I
 K       = 8    # neighbor slots
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIS binning
+# ─────────────────────────────────────────────────────────────────────────────
+
+# cuts: inner bin boundaries (exclusive upper). vals: one more element than cuts.
+LIS_BINS: Dict[str, Dict] = {
+    '3':    {'use_abs': False,
+             'cuts': [-7.5696, 6.4434],
+             'vals': [-1.0, 0.0, 1.0]},
+    '5':    {'use_abs': False,
+             'cuts': [-16.3463, -4.3708, 3.4246, 15.5837],
+             'vals': [-2.0, -1.0, 0.0, 1.0, 2.0]},
+    'abs3': {'use_abs': True,
+             'cuts': [7.0097, 19.1421],
+             'vals': [0.0, 1.0, 2.0]},
+    'abs5': {'use_abs': True,
+             'cuts': [3.8898, 8.8855, 15.9786, 28.3202],
+             'vals': [0.0, 1.0, 2.0, 3.0, 4.0]},
+}
+
+
+def _lit_to_lis(lit: float, lis_mode: str) -> float:
+    cfg = LIS_BINS[lis_mode]
+    v   = abs(lit) if cfg['use_abs'] else lit
+    return cfg['vals'][bisect.bisect_right(cfg['cuts'], v)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Importance parameters  (per lis_mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# I_x = exp(-(lit^2 / (2*sx^2))) * exp(-ax * lis) * exp(-bx * delta_lane)
+# I_y = exp(-(lis^2 / (2*sy^2))) * exp(-ay * |lit|^1.5) * exp(-by * delta_lane)
+# I   = sqrt((I_x^2 + I_y^2) / 2)
+IMPORTANCE_PARAMS: Dict[str, Dict[str, float]] = {
+    'abs3': {'sx': 1.0, 'ax': 0.15, 'bx': 0.2, 'sy': 2.0, 'ay': 0.2,  'by': 0.125},
+    'abs5': {'sx': 2.0, 'ax': 0.15, 'bx': 0.2, 'sy': 2.0, 'ay': 0.1,  'by': 0.1},
+    '5':    {'sx': 1.0, 'ax': 0.15, 'bx': 0.2, 'sy': 2.0, 'ay': 0.1,  'by': 0.1},
+    '3':    {'sx': 0.5, 'ax': 0.15, 'bx': 0.2, 'sy': 2.0, 'ay': 0.2,  'by': 0.1},
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,11 +171,13 @@ class Config:
     t_front:  float = 3.0
     t_back:   float = 5.0
     vy_eps:   float = 0.27
-    eps_gate: float = 1.0   # raised from 0.1: improves dx sensitivity over dvx
+    eps_gate: float = 1.0   # raised from 0.1: improves lit sensitivity over dvx
+
+    # LIS mode
+    lis_mode: str = 'abs3'  # '3' | '5' | 'abs3' | 'abs5'
 
     # importance gate (set thresholds after first mmap pass)
     gate_mode:    str   = 'or'      # 'or' = (I_x>=theta_x OR I_y>=theta_y) | 'single' = I>=theta
-    gate_apply:   str   = 'feature' # 'feature' | 'mask' | 'ghost' | 'mask_all'
     gate_theta_x: float = 0.0       # I_x threshold (or-mode); 0.0 = legacy time-window gate
     gate_theta_y: float = 0.0       # I_y threshold (or-mode)
     gate_theta:   float = 0.0       # I  threshold (single-mode)
@@ -145,23 +185,9 @@ class Config:
     # lc_state version
     lc_version: str = "v2"           # "v1" (slot-based, tf_trajPred) | "v2" (dy-sign-based, neighformer)
 
-    # importance
-    importance_dl_mode: str = "dy"   # "dy" | "lane_id" | "lc_state"
-
     # output / execution
     dry_run:     bool = False
     num_workers: int  = 0   # 0 = os.cpu_count()
-
-
-# Importance parameters
-# I_x: exp(-(dx_time^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
-# I_y: exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |dx_time|^1.5) * exp(-by * delta_lane)
-# I  : sqrt((I_x^2 + I_y^2) / 2)
-IMPORTANCE_PARAMS: Dict[str, Dict[str, float]] = {
-    "dy":       {"sx": 15.0, "ax": 0.2, "bx": 0.25, "sy": 2.0, "ay": 0.01, "by": 0.1},
-    "lane_id":  {"sx": 15.0, "ax": 0.2, "bx": 0.25, "sy": 2.0, "ay": 0.01, "by": 0.1},
-    "lc_state": {"sx": 15.0, "ax": 0.2, "bx": 0.25, "sy": 2.0, "ay": 0.01, "by": 0.1},
-}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,25 +208,22 @@ def _safe_float(x: np.ndarray, default: float = 0.0) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_importance(
-    dx_time: float,
+    lit: float,
     delta_lane: float,
-    lc_state: float,
-    mode: str,
+    lis: float,
+    lis_mode: str,
 ) -> Tuple[float, float, float]:
     """
-    I_x = exp(-(dx_time^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
-        dx_time    = dx / (dvx +- eps)
-        delta_lane = |nb_lane_id - ego_lane_id|  in {0, 1, 2, ...}
-        lc_state:  {0: closing in, 1: stay, 2: moving out}
-    I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |dx_time|^1.5) * exp(-by * delta_lane)
+    I_x = exp(-(lit^2 / (2*sx^2))) * exp(-ax * lis) * exp(-bx * delta_lane)
+    I_y = exp(-(lis^2 / (2*sy^2))) * exp(-ay * |lit|^1.5) * exp(-by * delta_lane)
     I   = sqrt((I_x^2 + I_y^2) / 2)
     """
-    p  = IMPORTANCE_PARAMS[mode]
-    ix = float(np.exp(-(dx_time ** 2) / (2.0 * p["sx"] ** 2))
-               * np.exp(-p["ax"] * lc_state)
+    p  = IMPORTANCE_PARAMS[lis_mode]
+    ix = float(np.exp(-(lit ** 2) / (2.0 * p["sx"] ** 2))
+               * np.exp(-p["ax"] * lis)
                * np.exp(-p["bx"] * delta_lane))
-    iy = float(np.exp(-(lc_state ** 2) / (2.0 * p["sy"] ** 2))
-               * np.exp(-p["ay"] * (abs(dx_time) ** 1.5))
+    iy = float(np.exp(-(lis ** 2) / (2.0 * p["sy"] ** 2))
+               * np.exp(-p["ay"] * (abs(lit) ** 1.5))
                * np.exp(-p["by"] * delta_lane))
     i_total = float(np.sqrt((ix ** 2 + iy ** 2) / 2.0))
     return ix, iy, i_total
@@ -375,29 +398,8 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
             ego_lane_arr = lane_id[ego_rows].astype(np.int32)
 
-            # ── ego aux: latLaneCenterOffset / laneChange / norm_off ─────────
-            ego_dd_v = vid_to_dd.get(v, 0)   # 원본 주행 방향 (flip 전)
-            lat_off  = np.zeros(T, np.float32)
-            lane_w   = np.zeros(T, np.float32)
-            for ti in range(T):
-                lid = int(ego_lane_arr[ti])
-                if lid <= 0:
-                    continue
-                if ego_dd_v == 1 and len(upper_center) >= lid:
-                    lat_off[ti] = float(ey[ti] - upper_center[lid - 1])
-                    lane_w[ti]  = float(upper_width[lid - 1])
-                elif ego_dd_v == 2 and len(lower_center) >= lid:
-                    lat_off[ti] = float(ey[ti] - lower_center[lid - 1])
-                    lane_w[ti]  = float(lower_width[lid - 1])
-            half_w   = lane_w * 0.5
-            norm_off = np.zeros(T, np.float32)
-            ok       = half_w > 1e-6
-            norm_off[ok] = lat_off[ok] / half_w[ok]
-            ego_lc   = lane_change[ego_rows].astype(np.float32)
-            # ─────────────────────────────────────────────────────────────────
-
             x_ego = np.stack(
-                [ex, ey, exv, eyv, exa, eya, lat_off, ego_lc, norm_off], axis=1
+                [ex, ey, exv, eyv, exa, eya], axis=1
             ).astype(np.float32)
 
             y_fut = np.stack([x[fut_rows],  y[fut_rows]],  axis=1).astype(np.float32)
@@ -457,12 +459,13 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
                     dx  = float(rel[0])
                     dvx = float(rel[2])
-                    # eps_gate raised to 1.0: keeps dx dominant over dvx in dx_time
-                    dx_time    = dx / (dvx + (cfg.eps_gate if dvx >= 0 else -cfg.eps_gate))
+                    # eps_gate raised to 1.0: keeps dx dominant over dvx in lit
+                    lit        = dx / (dvx + (cfg.eps_gate if dvx >= 0 else -cfg.eps_gate))
+                    lis        = _lit_to_lis(lit, cfg.lis_mode)
                     delta_lane = float(abs(int(lane_id[r]) - int(ego_lane_arr[ti])))
 
                     ix, iy, i_total = compute_importance(
-                        dx_time, delta_lane, lc_state, cfg.importance_dl_mode
+                        lit, delta_lane, lis, cfg.lis_mode
                     )
 
                     # gate: importance-based
@@ -472,45 +475,16 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                         gate = 1.0 if (ix >= cfg.gate_theta_x or iy >= cfg.gate_theta_y) else 0.0
                     else:
                         # fallback: legacy time-window gate (use until thresholds are calibrated)
-                        gate = 1.0 if (-cfg.t_back < dx_time < cfg.t_front) else 0.0
+                        gate = 1.0 if (-cfg.t_back < lit < cfg.t_front) else 0.0
 
                     x_nb[ti, ki, 6]  = lc_state
-                    x_nb[ti, ki, 7]  = dx_time
+                    x_nb[ti, ki, 7]  = lit
+                    x_nb[ti, ki, 8]  = lis
                     i_total *= gate   # gate as activation: I=0 if gate=0, I unchanged if gate=1
-
-                    x_nb[ti, ki, 9]  = ix
-                    x_nb[ti, ki, 10] = iy
-                    x_nb[ti, ki, 11] = i_total
-
-                    if cfg.gate_apply == 'mask':
-                        # per-timestep: nb_mask=False only, x_nb values kept
-                        if gate == 0.0:
-                            nb_mask[ti, ki] = False
-                        x_nb[ti, ki, 8] = gate
-                    elif cfg.gate_apply == 'ghost':
-                        # nb_mask unchanged; gate=0 -> sentinel value
-                        if gate == 0.0:
-                            x_nb[ti, ki, :] = 99999.0
-                            x_nb[ti, ki, 8] = 0.0
-                        else:
-                            x_nb[ti, ki, 8] = 1.0
-                    elif cfg.gate_apply == 'mask_all':
-                        # accumulate gate; post-process after all timesteps
-                        x_nb[ti, ki, 8] = gate
-                    else:
-                        # 'feature': store raw gate value (default)
-                        x_nb[ti, ki, 8] = gate
-
-            # post-process: mask_all — gate=0 for ALL t -> mask entire neighbor
-            if cfg.gate_apply == 'mask_all':
-                for ki in range(K):
-                    gates_ki = x_nb[:, ki, 8]          # (T,) accumulated gate values
-                    if not np.any(nb_mask[:, ki]):
-                        continue
-                    if np.all(gates_ki == 0.0):
-                        nb_mask[:, ki] = False
-                        x_nb[:, ki, :] = 0.0
-                    # else: keep as-is (partial gate info in x_nb[:,ki,8])
+                    x_nb[ti, ki, 9]  = gate
+                    x_nb[ti, ki, 10] = ix
+                    x_nb[ti, ki, 11] = iy
+                    x_nb[ti, ki, 12] = i_total
 
             x_ego_list.append(x_ego)
             y_fut_list.append(y_fut)
@@ -646,18 +620,22 @@ def parse_args() -> Config:
     ap.add_argument("--t_front",  type=float, default=3.0)
     ap.add_argument("--t_back",   type=float, default=5.0)
     ap.add_argument("--vy_eps",   type=float, default=0.27)
-    ap.add_argument("--eps_gate",      type=float, default=1.0,
-                    help="eps for dx_time denominator clamp (raised to 1.0)")
+    ap.add_argument("--eps_gate", type=float, default=1.0,
+                    help="eps for lit denominator clamp (raised to 1.0)")
+
+    # LIS
+    ap.add_argument("--lis_mode", default="abs3", choices=["3", "5", "abs3", "abs5"],
+                    help=(
+                        "LIS binning mode: "
+                        "3=dx_time 3-bin {-1,0,1} | "
+                        "5=dx_time 5-bin {-2,-1,0,1,2} | "
+                        "abs3=|dx_time| 3-bin {0,1,2} | "
+                        "abs5=|dx_time| 5-bin {0,1,2,3,4}"
+                    ))
+
+    # gate
     ap.add_argument("--gate_mode",     default="single", choices=["or", "single"],
                     help="or: (I_x>=theta_x OR I_y>=theta_y) | single: I>=theta")
-    ap.add_argument("--gate_apply",    default="feature",
-                    choices=["feature", "mask", "ghost", "mask_all"],
-                    help=(
-                        "feature: gate as 0/1 feature (default) | "
-                        "mask: gate=0 at t -> nb_mask=False only | "
-                        "ghost: gate=0 -> x_nb=99999 sentinel | "
-                        "mask_all: all-t gate=0 -> nb_mask=False + x_nb=0"
-                    ))
     ap.add_argument("--gate_theta_x",  type=float, default=0.0,
                     help="I_x threshold for or-mode (P85). 0.0 = legacy gate")
     ap.add_argument("--gate_theta_y",  type=float, default=0.0,
@@ -668,10 +646,6 @@ def parse_args() -> Config:
                     help="lc_state 계산 방식: "
                          "v1=slot기반 절대yV (tf_trajPred 방식, 값범주 {-3,-2,-1,0,1,2,3}), "
                          "v2=dy부호+윈도우평균yV (neighformer 방식, 값범주 {0,1,2}, default)")
-
-    # importance
-    ap.add_argument("--importance_dl_mode", default="dy",
-                    choices=["dy", "lane_id", "lc_state"])
 
     ap.add_argument("--dry_run", action="store_true")
 
@@ -689,13 +663,12 @@ def parse_args() -> Config:
         t_back   = a.t_back,
         vy_eps   = a.vy_eps,
         eps_gate      = a.eps_gate,
+        lis_mode      = a.lis_mode,
         gate_mode     = a.gate_mode,
-        gate_apply    = a.gate_apply,
         gate_theta_x  = a.gate_theta_x,
         gate_theta_y  = a.gate_theta_y,
         gate_theta    = a.gate_theta,
         lc_version    = a.lc_version,
-        importance_dl_mode = a.importance_dl_mode,
         dry_run     = a.dry_run,
         num_workers = a.num_workers,
     )

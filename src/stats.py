@@ -31,11 +31,9 @@ def make_stats_filename(
     *,
     ego_mode:     str,
     nb_kin_mode:  str,
-    use_lat_off:  bool = False,
-    use_lc_flag:  bool = False,
-    use_norm_off: bool = False,
     use_lc_state: bool = False,
-    use_dx_time:  bool = False,
+    use_lit:      bool = False,
+    use_lis:      bool = False,
     use_gate:     bool = False,
     use_I_x:      bool = False,
     use_I_y:      bool = False,
@@ -48,22 +46,18 @@ def make_stats_filename(
     --------
     >>> make_stats_filename(ego_mode="p", nb_kin_mode="pva", use_gate=True)
     'ego_p__pva_gate.npz'
-    >>> make_stats_filename(ego_mode="pva", nb_kin_mode="pv", use_lc_state=True, use_lat_off=True)
-    'ego_pva_latoff__pv_lcs.npz'
+    >>> make_stats_filename(ego_mode="pva", nb_kin_mode="pv", use_lc_state=True, use_lis=True)
+    'ego_pva__pv_lcs_lis.npz'
     """
-    ego_parts = [ego_mode.lower()]
-    if use_lat_off:  ego_parts.append("latoff")
-    if use_lc_flag:  ego_parts.append("lcf")
-    if use_norm_off: ego_parts.append("noff")
-
     nb_parts = [nb_kin_mode.lower()]
     if use_lc_state: nb_parts.append("lcs")
-    if use_dx_time:  nb_parts.append("dxt")
+    if use_lit:      nb_parts.append("lit")
+    if use_lis:      nb_parts.append("lis")
     if use_gate:     nb_parts.append("gate")
     if use_I_x:      nb_parts.append("Ix")
     if use_I_y:      nb_parts.append("Iy")
     if use_I:        nb_parts.append("I")
-    return f"ego_{'_'.join(ego_parts)}__{('_'.join(nb_parts))}.npz"
+    return f"ego_{ego_mode.lower()}__{('_'.join(nb_parts))}.npz"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -105,12 +99,10 @@ def compute_stats_if_needed(
     data_dir:     Path,
     splits_dir:   Path,
     ego_mode:     str  = "pva",
-    use_lat_off:  bool = False,
-    use_lc_flag:  bool = False,
-    use_norm_off: bool = False,
     nb_kin_mode:  str  = "pva",
     use_lc_state: bool = False,
-    use_dx_time:  bool = False,
+    use_lit:      bool = False,
+    use_lis:      bool = False,
     use_gate:     bool = False,
     use_I_x:      bool = False,
     use_I_y:      bool = False,
@@ -125,12 +117,10 @@ def compute_stats_if_needed(
         splits_dir   = splits_dir,
         stats_path   = stats_path,
         ego_mode     = ego_mode,
-        use_lat_off  = use_lat_off,
-        use_lc_flag  = use_lc_flag,
-        use_norm_off = use_norm_off,
         nb_kin_mode  = nb_kin_mode,
         use_lc_state = use_lc_state,
-        use_dx_time  = use_dx_time,
+        use_lit      = use_lit,
+        use_lis      = use_lis,
         use_gate     = use_gate,
         use_I_x      = use_I_x,
         use_I_y      = use_I_y,
@@ -149,12 +139,10 @@ def compute_stats(
     splits_dir: Path,
     stats_path: Path,
     ego_mode:     str  = "pva",
-    use_lat_off:  bool = False,
-    use_lc_flag:  bool = False,
-    use_norm_off: bool = False,
     nb_kin_mode:  str  = "pva",
     use_lc_state: bool = False,
-    use_dx_time:  bool = False,
+    use_lit:      bool = False,
+    use_lis:      bool = False,
     use_gate:     bool = False,
     use_I_x:      bool = False,
     use_I_y:      bool = False,
@@ -177,10 +165,10 @@ def compute_stats(
     {"ego_mean", "ego_std", "nb_mean", "nb_std"}  as np.ndarray
     """
     from src.dataset import (
-        _EGO_MODE_SLICES, _EGO_IDX_LAT_OFF, _EGO_IDX_LC_FLAG, _EGO_IDX_NORM_OFF,
+        _EGO_MODE_SLICES,
         _NB_KIN_MODE_SLICES, _NB_KIN_MODES_NONCONTIGUOUS,
-        _NB_IDX_LC, _NB_IDX_DXTIME, _NB_IDX_GATE,
-        _NB_IDX_IX, _NB_IDX_IY, _NB_IDX_I,
+        _NB_IDX_LC, _NB_IDX_LIT, _NB_IDX_LIS,
+        _NB_IDX_GATE, _NB_IDX_IX, _NB_IDX_IY, _NB_IDX_I,
     )
 
     print(f"[STATS] Computing stats → {stats_path}")
@@ -193,20 +181,16 @@ def compute_stats(
 
     # ── mmap 로드 ─────────────────────────────────────────────────────────────
     x_ego = np.load(Path(data_dir) / "x_ego.npy", mmap_mode="r")  # (N, T, 6)
-    x_nb  = np.load(Path(data_dir) / "x_nb.npy",  mmap_mode="r")  # (N, T, K, 12)
+    x_nb  = np.load(Path(data_dir) / "x_nb.npy",  mmap_mode="r")  # (N, T, K, 13)
 
     # ── ego 슬라이싱 ──────────────────────────────────────────────────────────
-    ego_sl    = _EGO_MODE_SLICES[ego_mode.lower()]
-    ego_raw   = x_ego[train_idx]                      # (n, T, 9)
-    ego_parts = [ego_raw[..., ego_sl]]
-    if use_lat_off:  ego_parts.append(ego_raw[..., _EGO_IDX_LAT_OFF  : _EGO_IDX_LAT_OFF  + 1])
-    if use_lc_flag:  ego_parts.append(ego_raw[..., _EGO_IDX_LC_FLAG  : _EGO_IDX_LC_FLAG  + 1])
-    if use_norm_off: ego_parts.append(ego_raw[..., _EGO_IDX_NORM_OFF : _EGO_IDX_NORM_OFF + 1])
-    ego_data  = np.concatenate(ego_parts, axis=-1)    # (n, T, ego_dim)
-    ego_flat  = ego_data.reshape(-1, ego_data.shape[-1])  # (n*T, ego_dim)
+    ego_sl   = _EGO_MODE_SLICES[ego_mode.lower()]
+    ego_raw  = x_ego[train_idx]                       # (n, T, 6)
+    ego_data = ego_raw[..., ego_sl]                   # (n, T, ego_dim)
+    ego_flat = ego_data.reshape(-1, ego_data.shape[-1])  # (n*T, ego_dim)
 
     # ── nb feature 슬라이싱 ───────────────────────────────────────────────────
-    nb_raw = x_nb[train_idx]                          # (n, T, K, 12)
+    nb_raw = x_nb[train_idx]                          # (n, T, K, 13)
 
     nb_parts = []
     nm = nb_kin_mode.lower()
@@ -219,12 +203,13 @@ def compute_stats(
         else:
             raise ValueError(f"Unknown nb_kin_mode: '{nb_kin_mode}'")
 
-    if use_lc_state: nb_parts.append(nb_raw[..., _NB_IDX_LC    : _NB_IDX_LC    + 1])
-    if use_dx_time:  nb_parts.append(nb_raw[..., _NB_IDX_DXTIME: _NB_IDX_DXTIME + 1])
-    if use_gate:     nb_parts.append(nb_raw[..., _NB_IDX_GATE  : _NB_IDX_GATE  + 1])
-    if use_I_x:      nb_parts.append(nb_raw[..., _NB_IDX_IX    : _NB_IDX_IX    + 1])
-    if use_I_y:      nb_parts.append(nb_raw[..., _NB_IDX_IY    : _NB_IDX_IY    + 1])
-    if use_I:        nb_parts.append(nb_raw[..., _NB_IDX_I     : _NB_IDX_I     + 1])
+    if use_lc_state: nb_parts.append(nb_raw[..., _NB_IDX_LC   : _NB_IDX_LC   + 1])
+    if use_lit:      nb_parts.append(nb_raw[..., _NB_IDX_LIT  : _NB_IDX_LIT  + 1])
+    if use_lis:      nb_parts.append(nb_raw[..., _NB_IDX_LIS  : _NB_IDX_LIS  + 1])
+    if use_gate:     nb_parts.append(nb_raw[..., _NB_IDX_GATE : _NB_IDX_GATE + 1])
+    if use_I_x:      nb_parts.append(nb_raw[..., _NB_IDX_IX   : _NB_IDX_IX   + 1])
+    if use_I_y:      nb_parts.append(nb_raw[..., _NB_IDX_IY   : _NB_IDX_IY   + 1])
+    if use_I:        nb_parts.append(nb_raw[..., _NB_IDX_I    : _NB_IDX_I    + 1])
 
     nb_data = np.concatenate(nb_parts, axis=-1)       # (n, T, K, nb_dim)
     nb_flat = nb_data.reshape(-1, nb_data.shape[-1])  # (n*T*K, nb_dim)
