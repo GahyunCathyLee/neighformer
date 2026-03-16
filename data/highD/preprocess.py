@@ -37,27 +37,50 @@ meta_recordingId / trackId / t0_frame : (N,)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 LIS (Longitudinal Interaction State) modes
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    '3'    : {-1, 0, 1}       lit 3-bin   [-inf, -7.5696, 6.4434, inf]
-    '5'    : {-2,-1,0,1,2}    lit 5-bin   [-inf,-16.3463,-4.3708,3.4246,15.5837,inf]
-    'abs3' : {0, 1, 2}        |lit| 3-bin [0, 7.0097, 19.1421, inf]
-    'abs5' : {0, 1, 2, 3, 4}  |lit| 5-bin [0, 3.8898, 8.8855, 15.9786, 28.3202, inf]
+    '3'    : {-1,...,1}      lit 3-bin   [-inf,-7.5696,6.4434,inf]
+    '5'    : {-2,...,2}      lit 5-bin   [-inf,-16.3463,-4.3708,3.4246,15.5837,inf]
+    '7'    : {-3,...,3}      lit 7-bin   [-inf,-22.0410,-10.2790,-3.1883,2.2974,9.1881,21.6504,inf]
+    '9'    : {-4,...,4}      lit 9-bin   [-inf,-26.4327,-14.5688,-7.5696,-2.5658,1.6850,6.4434,13.7152,26.2945,inf]
+    'abs3' : {0,...,2}       |lit| 3-bin [0,7.0097,19.1421,inf]
+    'abs5' : {0,...,4}       |lit| 5-bin [0,3.8898,8.8855,15.9786,28.3202,inf]
+    'abs7' : {0,...,6}       |lit| 7-bin [0,2.7407,5.8056,9.7500,14.7857,21.8527,34.9188,inf]
+    'abs9' : {0,...,8}       |lit| 9-bin [0,2.1239,4.3598,7.0097,10.2521,14.1570,19.1421,26.3651,40.1801,inf]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Importance formula
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    I_x = exp(-(lit^2 / (2*sx^2))) * exp(-ax * lis) * exp(-bx * delta_lane)
-    I_y = exp(-(lis^2 / (2*sy^2))) * exp(-ay * |lit|^1.5) * exp(-by * delta_lane)
+  [importance_mode='lis']  — default, bin-count-invariant
+    lnorm  = lis / L          where L = max(abs(LIS vals)) for the chosen lis_mode
+    sx_eff = sx / L           (base sx=1.0, calibrated at L=2)
+    ay_eff = ay * (L ** py)   (base ay=0.1, calibrated at L=2)
+
+    I_x = exp(-(lnorm^2 / (2*sx_eff^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+    I_y = exp(-(lc_state^2 / (2*sy^2)))  * exp(-ay_eff * |lnorm|^py) * exp(-by * delta_lane)
     I   = sqrt((I_x^2 + I_y^2) / 2)
 
     lit: Longitudinal Interaction Time = dx / (dvx ± eps)   eps=1.0
     lis: Longitudinal Interaction State (discrete, LIS_BINS[lis_mode])
     delta_lane = |nb_lane_id - ego_lane_id|  in {0, 1, 2, ...}
 
-    Params per lis_mode:
-        'abs3': sx=1.0, ax=0.15, bx=0.2, sy=2.0, ay=0.2,  by=0.125
-        'abs5': sx=2.0, ax=0.15, bx=0.2, sy=2.0, ay=0.1,  by=0.1
-        '5':    sx=1.0, ax=0.15, bx=0.2, sy=2.0, ay=0.1,  by=0.1
-        '3':    sx=0.5, ax=0.15, bx=0.2, sy=2.0, ay=0.2,  by=0.1
+    Base params (shared, calibrated at lis_mode='5' / L=2):
+        sx=1.0, ax=0.15, bx=0.2, sy=2.0, ay=0.1, by=0.1, py=1.5
+
+    Effective params per L:
+        L=1 (3-bin)  : sx_eff=1.000, ay_eff=0.1000
+        L=2 (5-bin)  : sx_eff=0.500, ay_eff=0.2828  ← reference
+        L=3 (7-bin)  : sx_eff=0.333, ay_eff=0.5196
+        L=4 (9-bin)  : sx_eff=0.250, ay_eff=0.8000
+        L=4 (abs5)   : sx_eff=0.250, ay_eff=0.8000
+        L=6 (abs7)   : sx_eff=0.167, ay_eff=1.4697
+        L=8 (abs9)   : sx_eff=0.125, ay_eff=2.2627
+
+  [importance_mode='lit']
+    I_x = exp(-(lit^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+    I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |lit|^1.5) * exp(-by * delta_lane)
+    I   = sqrt((I_x^2 + I_y^2) / 2)
+
+    Fixed params (from legacy highd_pipeline.py):
+        sx=15.0, ax=0.2, bx=0.25, sy=2.0, ay=0.01, by=0.1
 
     gate_mode='or':     gate = 1  if  (I_x >= theta_x) OR (I_y >= theta_y)
     gate_mode='single': gate = 1  if  I >= theta  (I = sqrt((I_x^2 + I_y^2) / 2))
@@ -104,19 +127,40 @@ K       = 8    # neighbor slots
 # ─────────────────────────────────────────────────────────────────────────────
 
 # cuts: inner bin boundaries (exclusive upper). vals: one more element than cuts.
+# L: max absolute LIS value, used to normalise lis -> lnorm = lis / L before importance calc.
 LIS_BINS: Dict[str, Dict] = {
     '3':    {'use_abs': False,
              'cuts': [-7.5696, 6.4434],
-             'vals': [-1.0, 0.0, 1.0]},
+             'vals': [-1.0, 0.0, 1.0],
+             'L': 1.0},
     '5':    {'use_abs': False,
              'cuts': [-16.3463, -4.3708, 3.4246, 15.5837],
-             'vals': [-2.0, -1.0, 0.0, 1.0, 2.0]},
+             'vals': [-2.0, -1.0, 0.0, 1.0, 2.0],
+             'L': 2.0},
+    '7':    {'use_abs': False,
+             'cuts': [-22.0410, -10.2790, -3.1883, 2.2974, 9.1881, 21.6504],
+             'vals': [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+             'L': 3.0},
+    '9':    {'use_abs': False,
+             'cuts': [-26.4327, -14.5688, -7.5696, -2.5658, 1.6850, 6.4434, 13.7152, 26.2945],
+             'vals': [-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0],
+             'L': 4.0},
     'abs3': {'use_abs': True,
              'cuts': [7.0097, 19.1421],
-             'vals': [0.0, 1.0, 2.0]},
+             'vals': [0.0, 1.0, 2.0],
+             'L': 2.0},
     'abs5': {'use_abs': True,
              'cuts': [3.8898, 8.8855, 15.9786, 28.3202],
-             'vals': [0.0, 1.0, 2.0, 3.0, 4.0]},
+             'vals': [0.0, 1.0, 2.0, 3.0, 4.0],
+             'L': 4.0},
+    'abs7': {'use_abs': True,
+             'cuts': [2.7407, 5.8056, 9.7500, 14.7857, 21.8527, 34.9188],
+             'vals': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+             'L': 6.0},
+    'abs9': {'use_abs': True,
+             'cuts': [2.1239, 4.3598, 7.0097, 10.2521, 14.1570, 19.1421, 26.3651, 40.1801],
+             'vals': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+             'L': 8.0},
 }
 
 
@@ -127,17 +171,34 @@ def _lit_to_lis(lit: float, lis_mode: str) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Importance parameters  (per lis_mode)
+# Importance parameters
 # ─────────────────────────────────────────────────────────────────────────────
 
-# I_x = exp(-(lit^2 / (2*sx^2))) * exp(-ax * lis) * exp(-bx * delta_lane)
-# I_y = exp(-(lis^2 / (2*sy^2))) * exp(-ay * |lit|^1.5) * exp(-by * delta_lane)
-# I   = sqrt((I_x^2 + I_y^2) / 2)
-IMPORTANCE_PARAMS: Dict[str, Dict[str, float]] = {
-    'abs3': {'sx': 1.0, 'ax': 0.15, 'bx': 0.2, 'sy': 2.0, 'ay': 0.2,  'by': 0.125},
-    'abs5': {'sx': 2.0, 'ax': 0.15, 'bx': 0.2, 'sy': 2.0, 'ay': 0.1,  'by': 0.1},
-    '5':    {'sx': 1.0, 'ax': 0.15, 'bx': 0.2, 'sy': 2.0, 'ay': 0.1,  'by': 0.1},
-    '3':    {'sx': 0.5, 'ax': 0.15, 'bx': 0.2, 'sy': 2.0, 'ay': 0.2,  'by': 0.1},
+# [importance_mode='lis']
+# lnorm = lis / L   where L = max(abs(LIS vals)) for the chosen lis_mode
+# sx_eff = sx / L,  ay_eff = ay * (L ** py)   — derived so that importance values are
+# identical to the L=2 (5-bin) reference when lis_mode='5'.
+#
+# I_x = exp(-(lnorm^2 / (2*sx_eff^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+#      ≡ exp(-(lis^2   / (2*sx^2)))     (same as before for L=2)
+# I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay_eff * |lnorm|^py) * exp(-by * delta_lane)
+#      ≡ exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |lis|^py)      (same as before for L=2)
+#
+# Base params (calibrated at L=2, i.e. lis_mode='5'):
+#   sx=1.0  -> sx_eff = 1.0/L   (e.g. 0.5   for L=2, 0.333 for L=3, 0.25 for L=4)
+#   ay=0.1  -> ay_eff = 0.1*L^1.5 (e.g. 0.2828 for L=2, 0.5196 for L=3, 0.8  for L=4)
+IMPORTANCE_PARAMS_LIS: Dict[str, float] = {
+    'sx': 1.0, 'ax': 0.15, 'bx': 0.2,
+    'sy': 2.0, 'ay': 0.1,  'by': 0.1, 'py': 1.5,
+}
+
+# [importance_mode='lit']
+# I_x = exp(-(lit^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+# I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |lit|^1.5) * exp(-by * delta_lane)
+# Fixed legacy params (from highd_pipeline.py)
+IMPORTANCE_PARAMS_LIT: Dict[str, float] = {
+    'sx': 15.0, 'ax': 0.2, 'bx': 0.25,
+    'sy':  2.0, 'ay': 0.01, 'by': 0.1,
 }
 
 
@@ -173,8 +234,11 @@ class Config:
     vy_eps:   float = 0.27
     eps_gate: float = 1.0   # raised from 0.1: improves lit sensitivity over dvx
 
-    # LIS mode
-    lis_mode: str = 'abs3'  # '3' | '5' | 'abs3' | 'abs5'
+    # LIS mode  (used when importance_mode='lis')
+    lis_mode: str = 'abs3'  # '3' | '5' | '7' | '9' | 'abs3' | 'abs5' | 'abs7' | 'abs9'
+
+    # importance mode
+    importance_mode: str = 'lis'  # 'lis' | 'lit'
 
     # importance gate (set thresholds after first mmap pass)
     gate_mode:    str   = 'or'      # 'or' = (I_x>=theta_x OR I_y>=theta_y) | 'single' = I>=theta
@@ -207,22 +271,60 @@ def _safe_float(x: np.ndarray, default: float = 0.0) -> np.ndarray:
 # Importance
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_importance(
-    lit: float,
-    delta_lane: float,
+def compute_importance_lis(
     lis: float,
+    delta_lane: float,
+    lc_state: float,
     lis_mode: str,
 ) -> Tuple[float, float, float]:
     """
-    I_x = exp(-(lit^2 / (2*sx^2))) * exp(-ax * lis) * exp(-bx * delta_lane)
-    I_y = exp(-(lis^2 / (2*sy^2))) * exp(-ay * |lit|^1.5) * exp(-by * delta_lane)
+    importance_mode='lis'  —  bin-count-invariant formulation.
+
+    Normalise:  lnorm = lis / L,  where L = LIS_BINS[lis_mode]['L']
+
+    Effective params (derived from base params so that importance values are
+    identical to the L=2 / lis_mode='5' reference):
+        sx_eff = sx / L          (keeps Gaussian width in normalised units)
+        ay_eff = ay * (L ** py)  (keeps exponential decay in normalised units)
+        all other params unchanged
+
+    I_x = exp(-(lnorm^2 / (2*sx_eff^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+    I_y = exp(-(lc_state^2 / (2*sy^2)))  * exp(-ay_eff * |lnorm|^py) * exp(-by * delta_lane)
     I   = sqrt((I_x^2 + I_y^2) / 2)
     """
-    p  = IMPORTANCE_PARAMS[lis_mode]
-    ix = float(np.exp(-(lit ** 2) / (2.0 * p["sx"] ** 2))
-               * np.exp(-p["ax"] * lis)
+    p      = IMPORTANCE_PARAMS_LIS
+    L      = LIS_BINS[lis_mode]['L']
+    lnorm  = lis / L
+    sx_eff = p["sx"] / L
+    ay_eff = p["ay"] * (L ** p["py"])
+
+    ix = float(np.exp(-(lnorm ** 2) / (2.0 * sx_eff ** 2))
+               * np.exp(-p["ax"] * lc_state)
                * np.exp(-p["bx"] * delta_lane))
-    iy = float(np.exp(-(lis ** 2) / (2.0 * p["sy"] ** 2))
+    iy = float(np.exp(-(lc_state ** 2) / (2.0 * p["sy"] ** 2))
+               * np.exp(-ay_eff * (abs(lnorm) ** p["py"]))
+               * np.exp(-p["by"] * delta_lane))
+    i_total = float(np.sqrt((ix ** 2 + iy ** 2) / 2.0))
+    return ix, iy, i_total
+
+
+def compute_importance_lit(
+    lit: float,
+    delta_lane: float,
+    lc_state: float,
+) -> Tuple[float, float, float]:
+    """
+    importance_mode='lit':
+        I_x = exp(-(lit^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+        I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |lit|^1.5) * exp(-by * delta_lane)
+        I   = sqrt((I_x^2 + I_y^2) / 2)
+    Fixed params: sx=15.0, ax=0.2, bx=0.25, sy=2.0, ay=0.01, by=0.1
+    """
+    p  = IMPORTANCE_PARAMS_LIT
+    ix = float(np.exp(-(lit ** 2) / (2.0 * p["sx"] ** 2))
+               * np.exp(-p["ax"] * lc_state)
+               * np.exp(-p["bx"] * delta_lane))
+    iy = float(np.exp(-(lc_state ** 2) / (2.0 * p["sy"] ** 2))
                * np.exp(-p["ay"] * (abs(lit) ** 1.5))
                * np.exp(-p["by"] * delta_lane))
     i_total = float(np.sqrt((ix ** 2 + iy ** 2) / 2.0))
@@ -464,9 +566,15 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     lis        = _lit_to_lis(lit, cfg.lis_mode)
                     delta_lane = float(abs(int(lane_id[r]) - int(ego_lane_arr[ti])))
 
-                    ix, iy, i_total = compute_importance(
-                        lit, delta_lane, lis, cfg.lis_mode
-                    )
+                    # ── importance: 'lis' mode or 'lit' mode ──────────────────
+                    if cfg.importance_mode == 'lit':
+                        ix, iy, i_total = compute_importance_lit(
+                            lit, delta_lane, lc_state
+                        )
+                    else:  # 'lis' (default)
+                        ix, iy, i_total = compute_importance_lis(
+                            lis, delta_lane, lc_state, cfg.lis_mode
+                        )
 
                     # gate: importance-based
                     if cfg.gate_mode == 'single' and cfg.gate_theta > 0.0:
@@ -528,6 +636,9 @@ def stage_raw2mmap(cfg: Config) -> None:
     n_workers = cfg.num_workers if cfg.num_workers > 0 else os.cpu_count()
     print(f"[Stage] raw -> mmap  |  {len(rec_ids)} recordings  |  "
           f"workers={n_workers}  |  mmap_path={cfg.mmap_path}")
+    print(f"  importance_mode : {cfg.importance_mode}"
+          + (f"  lis_mode : {cfg.lis_mode}" if cfg.importance_mode == 'lis' else
+             f"  params   : {IMPORTANCE_PARAMS_LIT}"))
 
     # ── pass 1: process all recordings in parallel ────────────────────────────
     bufs: List[Dict[str, np.ndarray]] = []
@@ -624,13 +735,27 @@ def parse_args() -> Config:
                     help="eps for lit denominator clamp (raised to 1.0)")
 
     # LIS
-    ap.add_argument("--lis_mode", default="abs3", choices=["3", "5", "abs3", "abs5"],
+    ap.add_argument("--lis_mode", default="abs3",
+                    choices=["3", "5", "7", "9", "abs3", "abs5", "abs7", "abs9"],
                     help=(
-                        "LIS binning mode: "
-                        "3=dx_time 3-bin {-1,0,1} | "
-                        "5=dx_time 5-bin {-2,-1,0,1,2} | "
-                        "abs3=|dx_time| 3-bin {0,1,2} | "
-                        "abs5=|dx_time| 5-bin {0,1,2,3,4}"
+                        "LIS binning mode (used when importance_mode=lis): "
+                        "3=lit 3-bin {-1,0,1} | "
+                        "5=lit 5-bin {-2,...,2} | "
+                        "7=lit 7-bin {-3,...,3} | "
+                        "9=lit 9-bin {-4,...,4} | "
+                        "abs3=|lit| 3-bin {0,1,2} | "
+                        "abs5=|lit| 5-bin {0,...,4} | "
+                        "abs7=|lit| 7-bin {0,...,6} | "
+                        "abs9=|lit| 9-bin {0,...,8}"
+                    ))
+
+    # importance mode
+    ap.add_argument("--importance_mode", default="lis", choices=["lis", "lit"],
+                    help=(
+                        "How to compute I_x / I_y / I: "
+                        "lis = use discrete LIS as interaction proxy (default, params per lis_mode) | "
+                        "lit = use continuous LIT and lc_state directly "
+                        "(legacy highd_pipeline.py params: sx=15,ax=0.2,bx=0.25,sy=2,ay=0.01,by=0.1)"
                     ))
 
     # gate
@@ -664,6 +789,7 @@ def parse_args() -> Config:
         vy_eps   = a.vy_eps,
         eps_gate      = a.eps_gate,
         lis_mode      = a.lis_mode,
+        importance_mode = a.importance_mode,
         gate_mode     = a.gate_mode,
         gate_theta_x  = a.gate_theta_x,
         gate_theta_y  = a.gate_theta_y,
