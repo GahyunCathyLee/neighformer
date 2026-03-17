@@ -214,7 +214,7 @@ def main():
                     help="Minimum threshold to search")
     ap.add_argument("--theta_max",   type=float, default=1.0,
                     help="Maximum threshold to search")
-    ap.add_argument("--theta_steps", type=int,   default=20,
+    ap.add_argument("--theta_steps", type=int,   default=50,
                     help="Number of threshold candidates to evaluate")
     ap.add_argument("--percentile",  default="p95",
                     choices=["p75", "p90", "p95", "p99", "max"],

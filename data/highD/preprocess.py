@@ -41,10 +41,6 @@ LIS (Longitudinal Interaction State) modes
     '5'    : {-2,...,2}      lit 5-bin   [-inf,-16.3463,-4.3708,3.4246,15.5837,inf]
     '7'    : {-3,...,3}      lit 7-bin   [-inf,-22.0410,-10.2790,-3.1883,2.2974,9.1881,21.6504,inf]
     '9'    : {-4,...,4}      lit 9-bin   [-inf,-26.4327,-14.5688,-7.5696,-2.5658,1.6850,6.4434,13.7152,26.2945,inf]
-    'abs3' : {0,...,2}       |lit| 3-bin [0,7.0097,19.1421,inf]
-    'abs5' : {0,...,4}       |lit| 5-bin [0,3.8898,8.8855,15.9786,28.3202,inf]
-    'abs7' : {0,...,6}       |lit| 7-bin [0,2.7407,5.8056,9.7500,14.7857,21.8527,34.9188,inf]
-    'abs9' : {0,...,8}       |lit| 9-bin [0,2.1239,4.3598,7.0097,10.2521,14.1570,19.1421,26.3651,40.1801,inf]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Importance formula
@@ -54,7 +50,10 @@ Importance formula
     I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |lis|^py) * exp(-by * delta_lane)
     I   = sqrt((I_x^2 + I_y^2) / 2)
 
-    lit: Longitudinal Interaction Time = dx / (dvx ± eps)   eps=1.0
+    lit: Longitudinal Interaction Time — gap / (dvx ± eps)   eps=1.0
+         gap = |x_rear_nb - x_front_ego|  if nb ahead (x_nb >= x_ego)
+             = |x_rear_ego - x_front_nb|  if nb behind (x_ego > x_nb)
+         front = center_x + 0.5*length,  rear = center_x - 0.5*length
     lis: Longitudinal Interaction State (discrete, LIS_BINS[lis_mode])
     delta_lane = |nb_lane_id - ego_lane_id|  in {0, 1, 2, ...}
 
@@ -69,9 +68,8 @@ Importance formula
     Fixed params (from legacy highd_pipeline.py):
         sx=15.0, ax=0.2, bx=0.25, sy=2.0, ay=0.01, by=0.1
 
-    gate_mode='or':     gate = 1  if  (I_x >= theta_x) OR (I_y >= theta_y)
     gate_mode='single': gate = 1  if  I >= theta  (I = sqrt((I_x^2 + I_y^2) / 2))
-        theta_x, theta_y, theta = P85 of respective distribution over dataset
+        theta = P85 of I distribution over dataset
 """
 
 from __future__ import annotations
@@ -116,45 +114,24 @@ K       = 8    # neighbor slots
 # cuts: inner bin boundaries (exclusive upper). vals: one more element than cuts.
 # L: max absolute LIS value, used to normalise lis -> lnorm = lis / L before importance calc.
 LIS_BINS: Dict[str, Dict] = {
-    '3':    {'use_abs': False,
-             'cuts': [-7.5696, 6.4434],
-             'vals': [-1.0, 0.0, 1.0],
-             'L': 1.0},
-    '5':    {'use_abs': False,
-             'cuts': [-16.3463, -4.3708, 3.4246, 15.5837],
-             'vals': [-2.0, -1.0, 0.0, 1.0, 2.0],
-             'L': 2.0},
-    '7':    {'use_abs': False,
-             'cuts': [-22.0410, -10.2790, -3.1883, 2.2974, 9.1881, 21.6504],
-             'vals': [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
-             'L': 3.0},
-    '9':    {'use_abs': False,
-             'cuts': [-26.4327, -14.5688, -7.5696, -2.5658, 1.6850, 6.4434, 13.7152, 26.2945],
-             'vals': [-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0],
-             'L': 4.0},
-    'abs3': {'use_abs': True,
-             'cuts': [7.0097, 19.1421],
-             'vals': [0.0, 1.0, 2.0],
-             'L': 2.0},
-    'abs5': {'use_abs': True,
-             'cuts': [3.8898, 8.8855, 15.9786, 28.3202],
-             'vals': [0.0, 1.0, 2.0, 3.0, 4.0],
-             'L': 4.0},
-    'abs7': {'use_abs': True,
-             'cuts': [2.7407, 5.8056, 9.7500, 14.7857, 21.8527, 34.9188],
-             'vals': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-             'L': 6.0},
-    'abs9': {'use_abs': True,
-             'cuts': [2.1239, 4.3598, 7.0097, 10.2521, 14.1570, 19.1421, 26.3651, 40.1801],
-             'vals': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-             'L': 8.0},
+    '3': {'cuts': [-5.8639, 4.9525],
+          'vals': [-1.0, 0.0, 1.0],
+          'L': 1.0},
+    '5': {'cuts': [-13.7033, -3.0238, 2.2735, 13.0957],
+          'vals': [-2.0, -1.0, 0.0, 1.0, 2.0],
+          'L': 2.0},
+    '7': {'cuts': [-18.7902, -8.2922, -1.9963, 1.3381, 7.3744, 18.5267],
+          'vals': [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+          'L': 3.0},
+    '9': {'cuts': [-22.7661, -12.1209, -5.8639, -1.4829, 0.9127, 4.9525, 11.4115, 22.7702],
+          'vals': [-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0],
+          'L': 4.0},
 }
 
 
 def _lit_to_lis(lit: float, lis_mode: str) -> float:
     cfg = LIS_BINS[lis_mode]
-    v   = abs(lit) if cfg['use_abs'] else lit
-    return cfg['vals'][bisect.bisect_right(cfg['cuts'], v)]
+    return cfg['vals'][bisect.bisect_right(cfg['cuts'], lit)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,20 +188,22 @@ class Config:
     # lc / gating
     t_front:  float = 3.0
     t_back:   float = 5.0
-    vy_eps:   float = 0.27
-    eps_gate: float = 1.0   # raised from 0.1: improves lit sensitivity over dvx
+    vy_eps:   float = 0.27   # used only by lc_version='v1'
+    eps_gate: float = 1.0    # raised from 0.1: improves lit sensitivity over dvx
+
+    # lc_state v2 (dvy-based) thresholds
+    dvy_eps_cross: float = 0.26   # |dvy| threshold for cross-lane slot neighbors
+    dvy_eps_same:  float = 1.03   # |dvy| threshold for same-lane slot (0/1) neighbors
+    dy_same:       float = 1.5    # |dy| < dy_same → treat as same-lane
 
     # LIS mode  (used when importance_mode='lis')
-    lis_mode: str = 'abs3'  # '3' | '5' | '7' | '9' | 'abs3' | 'abs5' | 'abs7' | 'abs9'
+    lis_mode: str = '3'  # '3' | '5' | '7' | '9'
 
     # importance mode
     importance_mode: str = 'lis'  # 'lis' | 'lit'
 
-    # importance gate (set thresholds after first mmap pass)
-    gate_mode:    str   = 'or'      # 'or' = (I_x>=theta_x OR I_y>=theta_y) | 'single' = I>=theta
-    gate_theta_x: float = 0.0       # I_x threshold (or-mode); 0.0 = legacy time-window gate
-    gate_theta_y: float = 0.0       # I_y threshold (or-mode)
-    gate_theta:   float = 0.0       # I  threshold (single-mode)
+    # importance gate (set threshold after first mmap pass)
+    gate_theta: float = 0.0   # I threshold (single-mode); 0.0 = legacy time-window gate
 
     # lc_state version
     lc_version: str = "v2"           # "v1" (slot-based, tf_trajPred) | "v2" (dy-sign-based, neighformer)
@@ -479,6 +458,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
             x_nb      = np.zeros((T, K, NB_DIM), np.float32)
             nb_mask   = np.zeros((T, K), bool)
+            len_ego   = float(vid_to_w.get(v, 0.0))
 
             for ti, hf in enumerate(hist_frames):
                 ego_vec = np.array([ex[ti], ey[ti], exv[ti], eyv[ti], exa[ti], eya[ti]], np.float32)
@@ -498,7 +478,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     nb_mask[ti, ki]   = True
 
                     # ── lc_state v1: slot-based, 현재 프레임 절대 yVelocity (tf_trajPred 방식) ──
-                    # ── lc_state v2: dy부호 + 윈도우 평균 yVelocity             (neighformer 방식) ──
+                    # ── lc_state v2: dvy-based, slot+dy 조합                  (neighformer 방식) ──
                     if cfg.lc_version == "v1":
                         vyn = float(yv[r])
                         if ki < 2:                          # same-lane lead / rear
@@ -512,26 +492,37 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                             elif vyn >  cfg.vy_eps: lc_state =  3.0  # away from ego lane
                             else:                   lc_state =  2.0  # staying
                     else:                                   # v2 (default)
-                        win_frames = [hf - w * step for w in range(int(round(cfg.target_hz)))]
-                        yv_vals = []
-                        for wf in win_frames:
-                            wr = per_vid_frame_to_row.get(nid, {}).get(int(wf))
-                            if wr is not None:
-                                yv_vals.append(float(yv[wr]))
-                        vyn = float(np.mean(yv_vals)) if yv_vals else float(yv[r])
+                        dy      = float(rel[1])
+                        dvy     = float(rel[3])
+                        abs_dvy = abs(dvy)
 
-                        dy_sign = float(rel[1])
-                        if abs(vyn) < cfg.vy_eps:
-                            lc_state = 1.0
-                        elif dy_sign * vyn > 0:
-                            lc_state = 2.0
+                        if ki < 2 and abs(dy) < cfg.dy_same:
+                            # Case 1: same-lane slot (0/1) AND |dy|<dy_same → same lane
+                            if abs_dvy > cfg.dvy_eps_same:
+                                lc_state = 2.0
+                            else:
+                                lc_state = 1.0
+                        elif ki >= 2:
+                            # Case 2: cross-lane slot → closing/staying/moving
+                            if abs_dvy > cfg.dvy_eps_cross:
+                                lc_state = 0.0 if dy * dvy < 0 else 2.0
+                            else:
+                                lc_state = 1.0
                         else:
-                            lc_state = 2.0 if ki < 2 else 0.0
+                            # Case 3: same-lane slot (0/1) but |dy|>=dy_same → transitioning
+                            lc_state = 0.0 if dy * dvy < 0 else 2.0
 
                     dx  = float(rel[0])
                     dvx = float(rel[2])
-                    # eps_gate raised to 1.0: keeps dx dominant over dvx in lit
-                    lit        = dx / (dvx + (cfg.eps_gate if dvx >= 0 else -cfg.eps_gate))
+                    len_nb   = float(vid_to_w.get(nid, 0.0))
+                    half_sum = 0.5 * (len_ego + len_nb)
+                    if dx >= 0:  # nb ahead: gap = x_rear_nb - x_front_ego
+                        gap        = abs(dx - half_sum)
+                        denom_base = dvx
+                    else:        # nb behind: gap = x_rear_ego - x_front_nb
+                        gap        = abs(-dx - half_sum)
+                        denom_base = -dvx
+                    lit = gap / (denom_base + (cfg.eps_gate if denom_base >= 0 else -cfg.eps_gate))
                     lis        = _lit_to_lis(lit, cfg.lis_mode)
                     delta_lane = float(abs(int(lane_id[r]) - int(ego_lane_arr[ti])))
 
@@ -545,13 +536,11 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                             lis, delta_lane, lc_state
                         )
 
-                    # gate: importance-based
-                    if cfg.gate_mode == 'single' and cfg.gate_theta > 0.0:
+                    # gate: importance-based (single mode)
+                    if cfg.gate_theta > 0.0:
                         gate = 1.0 if i_total >= cfg.gate_theta else 0.0
-                    elif cfg.gate_mode == 'or' and cfg.gate_theta_x > 0.0 and cfg.gate_theta_y > 0.0:
-                        gate = 1.0 if (ix >= cfg.gate_theta_x or iy >= cfg.gate_theta_y) else 0.0
                     else:
-                        # fallback: legacy time-window gate (use until thresholds are calibrated)
+                        # fallback: legacy time-window gate (use until threshold is calibrated)
                         gate = 1.0 if (-cfg.t_back < lit < cfg.t_front) else 0.0
 
                     x_nb[ti, ki, 6]  = lc_state
@@ -699,23 +688,26 @@ def parse_args() -> Config:
     # lc / gating
     ap.add_argument("--t_front",  type=float, default=3.0)
     ap.add_argument("--t_back",   type=float, default=5.0)
-    ap.add_argument("--vy_eps",   type=float, default=0.27)
+    ap.add_argument("--vy_eps",   type=float, default=0.27,
+                    help="yV threshold used only by lc_version=v1")
     ap.add_argument("--eps_gate", type=float, default=1.0,
                     help="eps for lit denominator clamp (raised to 1.0)")
+    ap.add_argument("--dvy_eps_cross", type=float, default=0.26,
+                    help="lc_state v2: |dvy| threshold for cross-lane slot neighbors")
+    ap.add_argument("--dvy_eps_same",  type=float, default=1.03,
+                    help="lc_state v2: |dvy| threshold for same-lane slot (0/1) neighbors")
+    ap.add_argument("--dy_same",       type=float, default=1.5,
+                    help="lc_state v2: |dy| < dy_same means same-lane for slot 0/1")
 
     # LIS
-    ap.add_argument("--lis_mode", default="abs3",
-                    choices=["3", "5", "7", "9", "abs3", "abs5", "abs7", "abs9"],
+    ap.add_argument("--lis_mode", default="9",
+                    choices=["3", "5", "7", "9"],
                     help=(
                         "LIS binning mode (used when importance_mode=lis): "
                         "3=lit 3-bin {-1,0,1} | "
                         "5=lit 5-bin {-2,...,2} | "
                         "7=lit 7-bin {-3,...,3} | "
-                        "9=lit 9-bin {-4,...,4} | "
-                        "abs3=|lit| 3-bin {0,1,2} | "
-                        "abs5=|lit| 5-bin {0,...,4} | "
-                        "abs7=|lit| 7-bin {0,...,6} | "
-                        "abs9=|lit| 9-bin {0,...,8}"
+                        "9=lit 9-bin {-4,...,4}"
                     ))
 
     # importance mode
@@ -728,18 +720,12 @@ def parse_args() -> Config:
                     ))
 
     # gate
-    ap.add_argument("--gate_mode",     default="single", choices=["or", "single"],
-                    help="or: (I_x>=theta_x OR I_y>=theta_y) | single: I>=theta")
-    ap.add_argument("--gate_theta_x",  type=float, default=0.0,
-                    help="I_x threshold for or-mode (P85). 0.0 = legacy gate")
-    ap.add_argument("--gate_theta_y",  type=float, default=0.0,
-                    help="I_y threshold for or-mode (P85). 0.0 = legacy gate")
-    ap.add_argument("--gate_theta",    type=float, default=0.0,
-                    help="I threshold for single-mode (P85). 0.0 = legacy gate")
+    ap.add_argument("--gate_theta", type=float, default=0.0,
+                    help="I threshold for single-mode (P85). 0.0 = legacy time-window gate")
     ap.add_argument("--lc_version", default="v2", choices=["v1", "v2"],
                     help="lc_state 계산 방식: "
                          "v1=slot기반 절대yV (tf_trajPred 방식, 값범주 {-3,-2,-1,0,1,2,3}), "
-                         "v2=dy부호+윈도우평균yV (neighformer 방식, 값범주 {0,1,2}, default)")
+                         "v2=dvy기반+slot/dy조합 (neighformer 방식, 값범주 {0,1,2}, default)")
 
     ap.add_argument("--dry_run", action="store_true")
 
@@ -757,12 +743,12 @@ def parse_args() -> Config:
         t_back   = a.t_back,
         vy_eps   = a.vy_eps,
         eps_gate      = a.eps_gate,
-        lis_mode      = a.lis_mode,
+        dvy_eps_cross = a.dvy_eps_cross,
+        dvy_eps_same  = a.dvy_eps_same,
+        dy_same       = a.dy_same,
+        lis_mode        = a.lis_mode,
         importance_mode = a.importance_mode,
-        gate_mode     = a.gate_mode,
-        gate_theta_x  = a.gate_theta_x,
-        gate_theta_y  = a.gate_theta_y,
-        gate_theta    = a.gate_theta,
+        gate_theta      = a.gate_theta,
         lc_version    = a.lc_version,
         dry_run     = a.dry_run,
         num_workers = a.num_workers,
