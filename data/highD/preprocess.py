@@ -49,30 +49,17 @@ LIS (Longitudinal Interaction State) modes
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Importance formula
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  [importance_mode='lis']  — default, bin-count-invariant
-    lnorm  = lis / L          where L = max(abs(LIS vals)) for the chosen lis_mode
-    sx_eff = sx / L           (base sx=1.0, calibrated at L=2)
-    ay_eff = ay * (L ** py)   (base ay=0.1, calibrated at L=2)
-
-    I_x = exp(-(lnorm^2 / (2*sx_eff^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
-    I_y = exp(-(lc_state^2 / (2*sy^2)))  * exp(-ay_eff * |lnorm|^py) * exp(-by * delta_lane)
+  [importance_mode='lis']  — default
+    I_x = exp(-(lis^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+    I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |lis|^py) * exp(-by * delta_lane)
     I   = sqrt((I_x^2 + I_y^2) / 2)
 
     lit: Longitudinal Interaction Time = dx / (dvx ± eps)   eps=1.0
     lis: Longitudinal Interaction State (discrete, LIS_BINS[lis_mode])
     delta_lane = |nb_lane_id - ego_lane_id|  in {0, 1, 2, ...}
 
-    Base params (shared, calibrated at lis_mode='5' / L=2):
+    Fixed params (applied as-is regardless of bin count):
         sx=1.0, ax=0.15, bx=0.2, sy=2.0, ay=0.1, by=0.1, py=1.5
-
-    Effective params per L:
-        L=1 (3-bin)  : sx_eff=1.000, ay_eff=0.1000
-        L=2 (5-bin)  : sx_eff=0.500, ay_eff=0.2828  ← reference
-        L=3 (7-bin)  : sx_eff=0.333, ay_eff=0.5196
-        L=4 (9-bin)  : sx_eff=0.250, ay_eff=0.8000
-        L=4 (abs5)   : sx_eff=0.250, ay_eff=0.8000
-        L=6 (abs7)   : sx_eff=0.167, ay_eff=1.4697
-        L=8 (abs9)   : sx_eff=0.125, ay_eff=2.2627
 
   [importance_mode='lit']
     I_x = exp(-(lit^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
@@ -175,18 +162,11 @@ def _lit_to_lis(lit: float, lis_mode: str) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # [importance_mode='lis']
-# lnorm = lis / L   where L = max(abs(LIS vals)) for the chosen lis_mode
-# sx_eff = sx / L,  ay_eff = ay * (L ** py)   — derived so that importance values are
-# identical to the L=2 (5-bin) reference when lis_mode='5'.
+# lis is used directly (no normalization). Fixed params apply regardless of bin count.
 #
-# I_x = exp(-(lnorm^2 / (2*sx_eff^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
-#      ≡ exp(-(lis^2   / (2*sx^2)))     (same as before for L=2)
-# I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay_eff * |lnorm|^py) * exp(-by * delta_lane)
-#      ≡ exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |lis|^py)      (same as before for L=2)
-#
-# Base params (calibrated at L=2, i.e. lis_mode='5'):
-#   sx=1.0  -> sx_eff = 1.0/L   (e.g. 0.5   for L=2, 0.333 for L=3, 0.25 for L=4)
-#   ay=0.1  -> ay_eff = 0.1*L^1.5 (e.g. 0.2828 for L=2, 0.5196 for L=3, 0.8  for L=4)
+# I_x = exp(-(lis^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+# I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |lis|^py) * exp(-by * delta_lane)
+# I   = sqrt((I_x^2 + I_y^2) / 2)
 IMPORTANCE_PARAMS_LIS: Dict[str, float] = {
     'sx': 1.0, 'ax': 0.15, 'bx': 0.2,
     'sy': 2.0, 'ay': 0.1,  'by': 0.1, 'py': 1.5,
@@ -275,34 +255,23 @@ def compute_importance_lis(
     lis: float,
     delta_lane: float,
     lc_state: float,
-    lis_mode: str,
 ) -> Tuple[float, float, float]:
     """
-    importance_mode='lis'  —  bin-count-invariant formulation.
+    importance_mode='lis'  —  lis used directly (no normalization).
+    Fixed params applied regardless of bin count (5 / 7 / 9 / abs variants).
 
-    Normalise:  lnorm = lis / L,  where L = LIS_BINS[lis_mode]['L']
-
-    Effective params (derived from base params so that importance values are
-    identical to the L=2 / lis_mode='5' reference):
-        sx_eff = sx / L          (keeps Gaussian width in normalised units)
-        ay_eff = ay * (L ** py)  (keeps exponential decay in normalised units)
-        all other params unchanged
-
-    I_x = exp(-(lnorm^2 / (2*sx_eff^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
-    I_y = exp(-(lc_state^2 / (2*sy^2)))  * exp(-ay_eff * |lnorm|^py) * exp(-by * delta_lane)
+    I_x = exp(-(lis^2 / (2*sx^2))) * exp(-ax * lc_state) * exp(-bx * delta_lane)
+    I_y = exp(-(lc_state^2 / (2*sy^2))) * exp(-ay * |lis|^py) * exp(-by * delta_lane)
     I   = sqrt((I_x^2 + I_y^2) / 2)
-    """
-    p      = IMPORTANCE_PARAMS_LIS
-    L      = LIS_BINS[lis_mode]['L']
-    lnorm  = lis / L
-    sx_eff = p["sx"] / L
-    ay_eff = p["ay"] * (L ** p["py"])
 
-    ix = float(np.exp(-(lnorm ** 2) / (2.0 * sx_eff ** 2))
+    Params: sx=1.0, ax=0.15, bx=0.2, sy=2.0, ay=0.1, by=0.1, py=1.5
+    """
+    p  = IMPORTANCE_PARAMS_LIS
+    ix = float(np.exp(-(lis ** 2) / (2.0 * p["sx"] ** 2))
                * np.exp(-p["ax"] * lc_state)
                * np.exp(-p["bx"] * delta_lane))
     iy = float(np.exp(-(lc_state ** 2) / (2.0 * p["sy"] ** 2))
-               * np.exp(-ay_eff * (abs(lnorm) ** p["py"]))
+               * np.exp(-p["ay"] * (abs(lis) ** p["py"]))
                * np.exp(-p["by"] * delta_lane))
     i_total = float(np.sqrt((ix ** 2 + iy ** 2) / 2.0))
     return ix, iy, i_total
@@ -573,7 +542,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                         )
                     else:  # 'lis' (default)
                         ix, iy, i_total = compute_importance_lis(
-                            lis, delta_lane, lc_state, cfg.lis_mode
+                            lis, delta_lane, lc_state
                         )
 
                     # gate: importance-based
