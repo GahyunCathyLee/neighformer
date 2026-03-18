@@ -292,7 +292,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     raw_dir  = cfg.raw_path
     rec_meta = pd.read_csv(raw_dir / f"{rec_id}_recordingMeta.csv")
     trk_meta = pd.read_csv(raw_dir / f"{rec_id}_tracksMeta.csv")
-    tracks   = pd.read_csv(raw_dir / f"{rec_id}_tracks.csv")
+    tracks   = pd.read_csv(raw_dir / f"{rec_id}_tracks.csv", low_memory=False)
 
     # ── 프레임레이트 / 윈도우 파라미터 ────────────────────────────────────────
     frame_rate = get_frame_rate(rec_meta)
