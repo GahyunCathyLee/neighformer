@@ -10,13 +10,14 @@ stats 계산은 train.py / evaluate.py 실행 시 src/stats.py 가 자동으로 
 Feature schema  (highD preprocess.py 와 동일한 output format)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 x_ego  : (N, T, 6)
-    [x, y, xV, yV, xA, yA]
+    [x, y, xV, yV, xA, yA]  — ego-centric normalised frame
+                               (last history frame → origin, heading → +x)
 
 x_nb   : (N, T, K, 13)   ego-relative neighbor features
-    idx  0  dx        longitudinal distance  (nb_x - ego_x)
-    idx  1  dy        lateral distance       (nb_y - ego_y)
-    idx  2  dvx       relative longitudinal velocity
-    idx  3  dvy       relative lateral velocity
+    idx  0  dx        longitudinal distance  (key-point based, ego local frame)
+    idx  1  dy        lateral distance       (key-point based, ego local frame)
+    idx  2  dvx       relative longitudinal velocity  (ego local frame)
+    idx  3  dvy       relative lateral velocity       (ego local frame)
     idx  4  dax       relative longitudinal acceleration
     idx  5  day       relative lateral acceleration
     idx  6  lc_state  lane-change state  {0: closing in, 1: stay, 2: moving out}
@@ -27,11 +28,16 @@ x_nb   : (N, T, K, 13)   ego-relative neighbor features
     idx 11  I_y       lateral importance
     idx 12  I         composite importance  sqrt((I_x^2 + I_y^2) / 2)
 
-y          : (N, Tf, 2)     future [x, y]
-y_vel      : (N, Tf, 2)     future [xV, yV]
-y_acc      : (N, Tf, 2)     future [xA, yA]
+    With --non_relative: idx 0-5 hold the neighbor's own values in the
+    normalised reference frame instead of ego-relative differences.
+    lc_state/LIT/importance (idx 6-12) always use relative values.
+
+y          : (N, Tf, 2)     future [x, y]  — ego-centric normalised frame
+y_vel      : (N, Tf, 2)     future [xV, yV] — normalised frame
+y_acc      : (N, Tf, 2)     future [xA, yA] — normalised frame
 nb_mask    : (N, T, K)      bool - True if neighbor exists
-x_last_abs : (N, 2)         last absolute (x, y) of ego history
+x_last_abs : (N, 2)         last absolute (x, y) of ego history (pre-normalisation)
+ref_heading: (N,)            ego heading [rad] at last history frame (for inverse transform)
 meta_recordingId / trackId / t0_frame : (N,)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -72,6 +78,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import concurrent.futures
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -182,7 +189,7 @@ class Config:
     dy_same:       float = 1.5
 
     # LIS mode
-    lis_mode: str = '3'   # '3' | '5' | '7' | '9'
+    lis_mode: str = '7'   # '3' | '5' | '7' | '9'
 
     # importance mode
     importance_mode: str = 'lis'  # 'lis' | 'lit'
@@ -191,10 +198,13 @@ class Config:
     gate_theta: float = 0.0   # 0.0 = legacy time-window gate
 
     # lc_state version
-    lc_version: str = "v2"    # "v1" | "v2"
+    lc_version: str = "v3"    # "v1" | "v2" | "v3"
 
     # exiD-specific: VRU 필터링
     drop_vru: bool = True     # VRU (motorcycle/bicycle/pedestrian) 윈도우 제거
+
+    # neighbor feature mode
+    non_relative: bool = False  # True → x_nb[0:6] = abs nb values in normalised frame
 
     # output / execution
     dry_run:     bool = False
@@ -285,6 +295,113 @@ def get_class_map(trk_meta: pd.DataFrame) -> Dict[int, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Geometry helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rot2d(vx: float, vy: float, h_rad: float) -> Tuple[float, float]:
+    """Project (vx, vy) onto a local frame whose heading is h_rad from global +x.
+    Returns (longitudinal, lateral) components."""
+    c, s = math.cos(h_rad), math.sin(h_rad)
+    return c * vx + s * vy, -s * vx + c * vy
+
+
+def _norm_pos(gx: float, gy: float,
+              ref_x: float, ref_y: float, ref_hdg_rad: float) -> Tuple[float, float]:
+    """Translate and rotate (gx, gy) into the ego-centric normalised frame.
+    ref_hdg_rad is the ego heading at the reference frame (last history step)."""
+    return _rot2d(gx - ref_x, gy - ref_y, ref_hdg_rad)
+
+
+def _local_to_norm_frame(lon: float, lat: float,
+                          veh_hdg_rad: float,
+                          ref_hdg_rad: float) -> Tuple[float, float]:
+    """Rotate a vehicle-local (lon, lat) vector into the normalised reference frame.
+    lon/lat are in the vehicle's own heading frame; veh_hdg_rad is the vehicle's
+    heading; ref_hdg_rad is the reference heading (ego last history frame)."""
+    delta = veh_hdg_rad - ref_hdg_rad
+    c, s = math.cos(delta), math.sin(delta)
+    return c * lon - s * lat, s * lon + c * lat
+
+
+def _rel_vel_ego_frame(nb_lon: float, nb_lat: float, nb_hdg: float,
+                        ego_lon: float, ego_lat: float, ego_hdg: float,
+                        ) -> Tuple[float, float]:
+    """Relative velocity (nb - ego) in ego's instantaneous local frame.
+    Inputs are vehicle-local lon/lat values and headings in radians."""
+    nb_vx  = nb_lon  * math.cos(nb_hdg)  - nb_lat  * math.sin(nb_hdg)
+    nb_vy  = nb_lon  * math.sin(nb_hdg)  + nb_lat  * math.cos(nb_hdg)
+    ego_vx = ego_lon * math.cos(ego_hdg) - ego_lat * math.sin(ego_hdg)
+    ego_vy = ego_lon * math.sin(ego_hdg) + ego_lat * math.cos(ego_hdg)
+    return _rot2d(nb_vx - ego_vx, nb_vy - ego_vy, ego_hdg)
+
+
+def _vehicle_front_rear_pts(
+    cx: float, cy: float, hdg_rad: float, w: float, l: float
+) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    """Compute front3 and rear3 key points of a vehicle in global frame.
+    front3 = [front_left, front_mid, front_right]
+    rear3  = [rear_left,  rear_mid,  rear_right ]
+    hdg_rad is the heading in radians.
+    """
+    ux, uy = math.cos(hdg_rad), math.sin(hdg_rad)    # longitudinal unit
+    lx, ly = -math.sin(hdg_rad), math.cos(hdg_rad)   # lateral unit
+    hl, hw = l / 2.0, w / 2.0
+    fm = (cx + hl * ux, cy + hl * uy)   # front_mid
+    rm = (cx - hl * ux, cy - hl * uy)   # rear_mid
+    front3 = [
+        (fm[0] + hw * lx, fm[1] + hw * ly),   # front_left
+        fm,                                     # front_mid
+        (fm[0] - hw * lx, fm[1] - hw * ly),   # front_right
+    ]
+    rear3 = [
+        (rm[0] + hw * lx, rm[1] + hw * ly),   # rear_left
+        rm,                                     # rear_mid
+        (rm[0] - hw * lx, rm[1] - hw * ly),   # rear_right
+    ]
+    return front3, rear3
+
+
+def _nb_dxdy(
+    slot: int,
+    ego_cx: float, ego_cy: float, ego_hdg: float, ego_w: float, ego_l: float,
+    nb_cx:  float, nb_cy:  float, nb_hdg:  float, nb_w:  float, nb_l:  float,
+) -> Tuple[float, float]:
+    """Compute (dx, dy) in ego's local frame using per-slot key-point rules.
+
+    alongside (3, 6): center-to-center projection; dy adjusted by
+                      -sign(dy) * 0.5 * (ego_w + nb_w)
+    lead      (0,2,5): closest pair from ego front3 × nb rear3
+    rear      (1,4,7): closest pair from ego rear3  × nb front3
+
+    The returned dx/dy vector is from the selected ego key point to the
+    selected neighbor key point, projected onto ego's local frame.
+    """
+    ego_front, ego_rear = _vehicle_front_rear_pts(ego_cx, ego_cy, ego_hdg, ego_w, ego_l)
+    nb_front,  nb_rear  = _vehicle_front_rear_pts(nb_cx,  nb_cy,  nb_hdg,  nb_w,  nb_l)
+
+    if slot in (3, 6):   # alongside
+        dx, dy = _rot2d(nb_cx - ego_cx, nb_cy - ego_cy, ego_hdg)
+        sign_dy = 1.0 if dy >= 0.0 else -1.0
+        dy -= sign_dy * 0.5 * (ego_w + nb_w)
+        return dx, dy
+
+    if slot in (0, 2, 5):   # lead: ego front3 × nb rear3
+        ego_pts, nb_pts = ego_front, nb_rear
+    else:                    # rear: ego rear3 × nb front3  (slots 1, 4, 7)
+        ego_pts, nb_pts = ego_rear, nb_front
+
+    best_d  = math.inf
+    best_ep = ego_pts[1]
+    best_np = nb_pts[1]
+    for ep in ego_pts:
+        for np_ in nb_pts:
+            d = math.hypot(ep[0] - np_[0], ep[1] - np_[1])
+            if d < best_d:
+                best_d, best_ep, best_np = d, ep, np_
+    return _rot2d(best_np[0] - best_ep[0], best_np[1] - best_ep[1], ego_hdg)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-recording processing  (raw CSV -> list of sample dicts)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -302,20 +419,13 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     stride = max(1, int(round(cfg.stride_sec * cfg.target_hz)))
 
     # ── 필수 컬럼 체크 / 기본값 주입 ─────────────────────────────────────────
-    # exiD neighbor 컬럼
     for c in NEIGHBOR_COLS_8:
         if c not in tracks.columns:
-            tracks[c] = -1   # exiD는 0 대신 -1을 missing 값으로 사용
+            tracks[c] = -1
 
-    # exiD 속도/가속도 컬럼 (lonVelocity/latVelocity/lonAcceleration/latAcceleration)
-    for src, dst in [
-        ("lonVelocity",     "lonVelocity"),
-        ("latVelocity",     "latVelocity"),
-        ("lonAcceleration", "lonAcceleration"),
-        ("latAcceleration", "latAcceleration"),
-    ]:
+    for src in ["lonVelocity", "latVelocity", "lonAcceleration", "latAcceleration"]:
         if src not in tracks.columns:
-            tracks[dst] = 0.0
+            tracks[src] = 0.0
 
     if "laneletId" not in tracks.columns:
         tracks["laneletId"] = -1
@@ -323,15 +433,11 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     # ── VRU 클래스 맵 ─────────────────────────────────────────────────────────
     class_map = get_class_map(trk_meta)
 
-    # ── 차량 크기 맵 (exiD: tracks 행 자체에 width/length가 있음) ──────────────
-    # highD는 tracksMeta의 width(=차량길이)/height(=차량너비)를 사용했지만,
-    # exiD는 tracks CSV의 각 행에 width/length가 직접 기록됨.
-    # 여기서는 첫 번째 등장 행의 값을 차량 고유 크기로 사용합니다.
+    # ── 차량 크기 배열 ────────────────────────────────────────────────────────
     has_width  = "width"  in tracks.columns
     has_length = "length" in tracks.columns
 
     # ── NumPy 배열 추출 ───────────────────────────────────────────────────────
-    # exiD는 xCenter/yCenter (중심 좌표) → highD처럼 +0.5*size 보정 불필요
     tracks = tracks.sort_values(["trackId", "frame"], kind="mergesort").reset_index(drop=True)
 
     frame   = tracks["frame"].astype(np.int32).to_numpy()
@@ -345,13 +451,22 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     ya      = tracks["latAcceleration"].astype(np.float32).to_numpy()
     lane_id = tracks["laneletId"].fillna(-1).astype(np.int32).to_numpy()
 
+    # latLaneCenterOffset (first semicolon-separated value per row)
+    if "latLaneCenterOffset" in tracks.columns:
+        _lco_s = tracks["latLaneCenterOffset"].astype(str).str.strip().str.split(";").str[0]
+        lat_lane_offset_arr = pd.to_numeric(_lco_s, errors="coerce").fillna(0.0).astype(np.float32).to_numpy()
+    else:
+        lat_lane_offset_arr = np.zeros(len(tracks), np.float32)
+
+    # heading (degrees in CSV → radians for computation)
+    heading_deg = (tracks["heading"].astype(np.float32).to_numpy()
+                   if "heading" in tracks.columns
+                   else np.zeros(len(tracks), np.float32))
+    heading_rad = np.deg2rad(heading_deg).astype(np.float32)
+
     # 차량 크기 배열 (per-row)
     width_arr  = _safe_float(tracks["width"].to_numpy(np.float32),  0.0) if has_width  else np.zeros(len(tracks), np.float32)
     length_arr = _safe_float(tracks["length"].to_numpy(np.float32), 0.0) if has_length else np.zeros(len(tracks), np.float32)
-
-    # ── exiD는 drivingDirection flip 없음 ─────────────────────────────────────
-    # highD에서는 방향 1(왼쪽) 차량들을 flip하여 모든 차량이 오른쪽 방향으로
-    # 주행하도록 정규화했지만, exiD는 좌표계가 이미 통일되어 있습니다.
 
     # ── 원점 이동 (recording 내 min_x, min_y 기준) ───────────────────────────
     x_min = float(np.nanmin(x)) if x.size else 0.0
@@ -370,41 +485,47 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                                         for fr, r in zip(frame[idxs], idxs)}
 
     # ── 차량 크기 딕셔너리 (첫 번째 행 기준) ─────────────────────────────────
-    vid_to_w: Dict[int, float] = {}   # width  (exiD: 차량 폭)
-    vid_to_l: Dict[int, float] = {}   # length (exiD: 차량 길이, lit 계산에 사용)
+    vid_to_w: Dict[int, float] = {}
+    vid_to_l: Dict[int, float] = {}
     for v, idxs in per_vid_rows.items():
         r0 = int(idxs[0])
         vid_to_w[int(v)] = float(width_arr[r0])
         vid_to_l[int(v)] = float(length_arr[r0])
+
+    # ── per-vehicle, per-frame heading lookup (radians) ───────────────────────
+    per_vid_frame_to_hdg: Dict[int, Dict[int, float]] = {
+        int(v): {int(frame[r]): float(heading_rad[r]) for r in idxs}
+        for v, idxs in per_vid_rows.items()
+    }
 
     # ── VRU 판별 함수 ─────────────────────────────────────────────────────────
     def is_vru(tid: int) -> bool:
         return class_map.get(int(tid), "other") in VRU_CLASSES
 
     # ── neighbor ID 배열 (N, 8) ───────────────────────────────────────────────
-    # exiD neighbor 컬럼은 세미콜론으로 여러 값이 들어올 수 있으므로 첫 값만 사용
     nb_id_cols = []
     for c in NEIGHBOR_COLS_8:
         s = tracks[c].astype(str).str.strip().str.split(";").str[0]
         nb_id_cols.append(pd.to_numeric(s, errors="coerce").fillna(-1).astype(np.int32).to_numpy())
-    nb_ids_all = np.stack(nb_id_cols, axis=1)   # (N, 8)
+    nb_ids_all = np.stack(nb_id_cols, axis=1)   # (rows, 8)
 
     # ── sample 수집 루프 ──────────────────────────────────────────────────────
-    x_ego_list:   List[np.ndarray] = []
-    y_fut_list:   List[np.ndarray] = []
-    y_vel_list:   List[np.ndarray] = []
-    y_acc_list:   List[np.ndarray] = []
-    x_nb_list:    List[np.ndarray] = []
-    nb_mask_list: List[np.ndarray] = []
-    trackid_list: List[int] = []
-    t0_list:      List[int] = []
+    x_ego_list:       List[np.ndarray] = []
+    y_fut_list:       List[np.ndarray] = []
+    y_vel_list:       List[np.ndarray] = []
+    y_acc_list:       List[np.ndarray] = []
+    x_nb_list:        List[np.ndarray] = []
+    nb_mask_list:     List[np.ndarray] = []
+    x_last_abs_list:  List[np.ndarray] = []
+    ref_heading_list: List[float]      = []
+    trackid_list:     List[int]        = []
+    t0_list:          List[int]        = []
 
     for v, idxs in per_vid_rows.items():
         frs = frame[idxs]
         if len(frs) < (T + Tf) * step:
             continue
 
-        # exiD: VRU ego 차량 필터링
         if cfg.drop_vru and is_vru(int(v)):
             continue
 
@@ -413,6 +534,10 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
         end_max   = int(frs[-1] - Tf       * step)
         if start_min > end_max:
             continue
+
+        ego_w = float(vid_to_w.get(v, 0.0))
+        ego_l = float(vid_to_l.get(v, 0.0))
+        hdg_map_ego = per_vid_frame_to_hdg.get(int(v), {})
 
         t0_frame = start_min
         while t0_frame <= end_max:
@@ -433,25 +558,60 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
             ego_lane_arr = lane_id[ego_rows].astype(np.int32)
 
-            x_ego = np.stack(
-                [ex, ey, exv, eyv, exa, eya], axis=1
-            ).astype(np.float32)
+            # ── ego heading per history frame ─────────────────────────────
+            ego_hdg_arr = np.array(
+                [hdg_map_ego.get(int(hf), 0.0) for hf in hist_frames], np.float32
+            )
 
-            y_fut = np.stack([x[fut_rows],  y[fut_rows]],  axis=1).astype(np.float32)
-            y_vel = np.stack([xv[fut_rows], yv[fut_rows]], axis=1).astype(np.float32)
-            y_acc = np.stack([xa[fut_rows], ya[fut_rows]], axis=1).astype(np.float32)
+            # ── normalisation reference: last history frame ───────────────
+            ref_x   = float(ex[-1])
+            ref_y   = float(ey[-1])
+            ref_hdg = float(ego_hdg_arr[-1])   # radians
+
+            # ── ego history: normalise positions + rotate vel/acc ─────────
+            ex_n  = np.zeros(T, np.float32)
+            ey_n  = np.zeros(T, np.float32)
+            exv_n = np.zeros(T, np.float32)
+            eyv_n = np.zeros(T, np.float32)
+            exa_n = np.zeros(T, np.float32)
+            eya_n = np.zeros(T, np.float32)
+            for ti in range(T):
+                ex_n[ti],  ey_n[ti]  = _norm_pos(
+                    float(ex[ti]), float(ey[ti]), ref_x, ref_y, ref_hdg)
+                exv_n[ti], eyv_n[ti] = _local_to_norm_frame(
+                    float(exv[ti]), float(eyv[ti]), float(ego_hdg_arr[ti]), ref_hdg)
+                exa_n[ti], eya_n[ti] = _local_to_norm_frame(
+                    float(exa[ti]), float(eya[ti]), float(ego_hdg_arr[ti]), ref_hdg)
+            x_ego = np.stack([ex_n, ey_n, exv_n, eyv_n, exa_n, eya_n],
+                             axis=1).astype(np.float32)
+
+            # ── future: normalise positions + rotate vel/acc ──────────────
+            y_fut_x = np.zeros(Tf, np.float32)
+            y_fut_y = np.zeros(Tf, np.float32)
+            y_vel_x = np.zeros(Tf, np.float32)
+            y_vel_y = np.zeros(Tf, np.float32)
+            y_acc_x = np.zeros(Tf, np.float32)
+            y_acc_y = np.zeros(Tf, np.float32)
+            for fi in range(Tf):
+                fr  = fut_rows[fi]
+                ff  = fut_frames[fi]
+                hdg_fi = float(hdg_map_ego.get(int(ff), ref_hdg))
+                y_fut_x[fi], y_fut_y[fi] = _norm_pos(
+                    float(x[fr]), float(y[fr]), ref_x, ref_y, ref_hdg)
+                y_vel_x[fi], y_vel_y[fi] = _local_to_norm_frame(
+                    float(xv[fr]), float(yv[fr]), hdg_fi, ref_hdg)
+                y_acc_x[fi], y_acc_y[fi] = _local_to_norm_frame(
+                    float(xa[fr]), float(ya[fr]), hdg_fi, ref_hdg)
+            y_fut = np.stack([y_fut_x, y_fut_y], axis=1).astype(np.float32)
+            y_vel = np.stack([y_vel_x, y_vel_y], axis=1).astype(np.float32)
+            y_acc = np.stack([y_acc_x, y_acc_y], axis=1).astype(np.float32)
 
             x_nb    = np.zeros((T, K, NB_DIM), np.float32)
             nb_mask = np.zeros((T, K), bool)
 
-            # exiD: LIT 계산에 차량 길이(length)를 사용 (highD에서 width를 썼던 이유:
-            # highD는 주행 방향이 x축이고 width가 차량 '길이'였음.
-            # exiD는 lonVelocity가 x축이므로 length가 종방향 크기에 해당함)
-            len_ego = float(vid_to_l.get(v, 0.0))
-
             for ti, hf in enumerate(hist_frames):
-                ego_vec = np.array([ex[ti], ey[ti], exv[ti], eyv[ti], exa[ti], eya[ti]], np.float32)
-                ids8    = nb_ids_all[ego_rows[ti]]
+                ego_hdg_ti = float(ego_hdg_arr[ti])
+                ids8       = nb_ids_all[ego_rows[ti]]
 
                 for ki in range(K):
                     nid = int(ids8[ki])
@@ -464,85 +624,123 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     if r is None:
                         continue
 
-                    # exiD: neighbor VRU 필터링 (ego가 아닌 neighbor에 적용)
                     if cfg.drop_vru and is_vru(nid):
                         continue
 
-                    nb_vec = np.array([x[r], y[r], xv[r], yv[r], xa[r], ya[r]], np.float32)
-                    rel    = nb_vec - ego_vec
-                    x_nb[ti, ki, 0:6] = rel
-                    nb_mask[ti, ki]   = True
+                    nb_w   = float(vid_to_w.get(nid, 0.0))
+                    nb_l   = float(vid_to_l.get(nid, 0.0))
+                    nb_hdg = float(per_vid_frame_to_hdg.get(nid, {}).get(int(hf), ego_hdg_ti))
 
-                    # ── lc_state (highD와 동일한 v1/v2 로직) ───────────────────
-                    # exiD slot 배열은 highD와 동일하게 구성됨:
-                    #   0: leadId (same-lane front)
-                    #   1: rearId (same-lane rear)
-                    #   2~4: left group
-                    #   5~7: right group
+                    # ── dx, dy: key-point based, ego local frame ──────────
+                    dx_key, dy_key = _nb_dxdy(
+                        ki,
+                        float(ex[ti]), float(ey[ti]), ego_hdg_ti, ego_w, ego_l,
+                        float(x[r]),   float(y[r]),   nb_hdg,     nb_w,  nb_l,
+                    )
+
+                    # ── relative vel/acc in ego's instantaneous local frame ─
+                    dvx_rel, dvy_rel = _rel_vel_ego_frame(
+                        float(xv[r]), float(yv[r]), nb_hdg,
+                        float(exv[ti]), float(eyv[ti]), ego_hdg_ti,
+                    )
+                    dax_rel, day_rel = _rel_vel_ego_frame(
+                        float(xa[r]), float(ya[r]), nb_hdg,
+                        float(exa[ti]), float(eya[ti]), ego_hdg_ti,
+                    )
+
+                    # ── feature values (may be replaced in non_relative mode) ─
+                    if cfg.non_relative:
+                        # neighbor's absolute values in normalised reference frame
+                        f_dx,  f_dy  = _norm_pos(
+                            float(x[r]),  float(y[r]),  ref_x, ref_y, ref_hdg)
+                        f_dvx, f_dvy = _local_to_norm_frame(
+                            float(xv[r]), float(yv[r]), nb_hdg, ref_hdg)
+                        f_dax, f_day = _local_to_norm_frame(
+                            float(xa[r]), float(ya[r]), nb_hdg, ref_hdg)
+                    else:
+                        f_dx,  f_dy  = dx_key,  dy_key
+                        f_dvx, f_dvy = dvx_rel, dvy_rel
+                        f_dax, f_day = dax_rel, day_rel
+
+                    x_nb[ti, ki, 0] = f_dx
+                    x_nb[ti, ki, 1] = f_dy
+                    x_nb[ti, ki, 2] = f_dvx
+                    x_nb[ti, ki, 3] = f_dvy
+                    x_nb[ti, ki, 4] = f_dax
+                    x_nb[ti, ki, 5] = f_day
+                    nb_mask[ti, ki] = True
+
+                    # ── lc_state ─────────────────────────────────────────
                     if cfg.lc_version == "v1":
                         vyn = float(yv[r])
                         if ki < 2:
                             lc_state = 0.0
                         elif ki < 5:   # left group
-                            if   vyn >  cfg.vy_eps if hasattr(cfg, 'vy_eps') else 0.27: lc_state = -1.0
-                            elif vyn < -(cfg.vy_eps if hasattr(cfg, 'vy_eps') else 0.27): lc_state = -3.0
-                            else:                   lc_state = -2.0
+                            if   vyn >  0.27: lc_state = -1.0
+                            elif vyn < -0.27: lc_state = -3.0
+                            else:             lc_state = -2.0
                         else:          # right group
-                            if   vyn < -(cfg.vy_eps if hasattr(cfg, 'vy_eps') else 0.27): lc_state =  1.0
-                            elif vyn >  (cfg.vy_eps if hasattr(cfg, 'vy_eps') else 0.27): lc_state =  3.0
-                            else:                   lc_state =  2.0
-                    else:   # v2 (default, highD와 동일)
-                        dy      = float(rel[1])
-                        dvy     = float(rel[3])
-                        abs_dvy = abs(dvy)
-
-                        if ki < 2 and abs(dy) < cfg.dy_same:
-                            if abs_dvy > cfg.dvy_eps_same:
-                                lc_state = 2.0
-                            else:
-                                lc_state = 1.0
+                            if   vyn < -0.27: lc_state =  1.0
+                            elif vyn >  0.27: lc_state =  3.0
+                            else:             lc_state =  2.0
+                    elif cfg.lc_version == "v2":
+                        _, dy_cc = _rot2d(
+                            float(x[r]) - float(ex[ti]),
+                            float(y[r]) - float(ey[ti]),
+                            ego_hdg_ti,
+                        )
+                        dvy_cc     = dvy_rel
+                        abs_dvy_cc = abs(dvy_cc)
+                        if ki < 2 and abs(dy_cc) < cfg.dy_same:
+                            lc_state = 2.0 if abs_dvy_cc > cfg.dvy_eps_same else 1.0
                         elif ki >= 2:
-                            if abs_dvy > cfg.dvy_eps_cross:
-                                lc_state = 0.0 if dy * dvy < 0 else 2.0
+                            if abs_dvy_cc > cfg.dvy_eps_cross:
+                                lc_state = 0.0 if dy_cc * dvy_cc < 0 else 2.0
                             else:
                                 lc_state = 1.0
                         else:
-                            lc_state = 0.0 if dy * dvy < 0 else 2.0
+                            lc_state = 0.0 if dy_cc * dvy_cc < 0 else 2.0
+                    else:  # v3 (default)
+                        nb_lat_v = float(yv[r])
+                        nb_lco   = float(lat_lane_offset_arr[r])
+                        if ki < 2:   # same lane (leadId, rearId)
+                            if (nb_lco < -1.0 and nb_lat_v > 0.0) or \
+                               (nb_lco >  1.0 and nb_lat_v < 0.0):
+                                lc_state = 0.0
+                            elif (nb_lco < -1.0 and nb_lat_v < 0.0) or \
+                                 (nb_lco >  1.0 and nb_lat_v > 0.0) or \
+                                 abs(nb_lat_v) > 0.029:
+                                lc_state = 2.0
+                            else:
+                                lc_state = 1.0
+                        elif ki < 5:  # left lane (leftLeadId, leftAlongsideId, leftRearId)
+                            if   nb_lat_v < -0.029: lc_state = 0.0
+                            elif nb_lat_v >  0.029: lc_state = 2.0
+                            else:                   lc_state = 1.0
+                        else:         # right lane (rightLeadId, rightAlongsideId, rightRearId)
+                            if   nb_lat_v < -0.029: lc_state = 2.0
+                            elif nb_lat_v >  0.029: lc_state = 0.0
+                            else:                   lc_state = 1.0
 
-                    # ── LIT 계산 ────────────────────────────────────────────────
-                    dx  = float(rel[0])
-                    dvx = float(rel[2])
-                    len_nb   = float(vid_to_l.get(nid, 0.0))
-                    half_sum = 0.5 * (len_ego + len_nb)
-                    if dx >= 0:
-                        gap        = abs(dx - half_sum)
-                        denom_base = dvx
-                    else:
-                        gap        = abs(-dx - half_sum)
-                        denom_base = -dvx
+                    # ── LIT: key-point dx, relative dvx in ego frame ──────
+                    # dx_key is already edge-to-edge for lead/rear slots
+                    gap = abs(dx_key)
+                    denom_base = dvx_rel if dx_key >= 0 else -dvx_rel
                     lit = gap / (denom_base + (cfg.eps_gate if denom_base >= 0 else -cfg.eps_gate))
                     lis = _lit_to_lis(lit, cfg.lis_mode)
 
-                    # ── delta_lane: exiD는 laneletId가 정수이므로 단순 차이 사용 ──
-                    # laneletId가 -1인 경우(미상) delta_lane=0으로 처리
+                    # ── delta_lane ────────────────────────────────────────
                     ego_lid = int(ego_lane_arr[ti])
                     nb_lid  = int(lane_id[r])
-                    if ego_lid >= 0 and nb_lid >= 0:
-                        delta_lane = float(abs(nb_lid - ego_lid))
-                    else:
-                        delta_lane = 0.0
+                    delta_lane = float(abs(nb_lid - ego_lid)) if (ego_lid >= 0 and nb_lid >= 0) else 0.0
 
-                    # ── importance 계산 (highD와 동일) ──────────────────────────
+                    # ── importance ────────────────────────────────────────
                     if cfg.importance_mode == 'lit':
-                        ix, iy, i_total = compute_importance_lit(
-                            lit, delta_lane, lc_state
-                        )
+                        ix, iy, i_total = compute_importance_lit(lit, delta_lane, lc_state)
                     else:
-                        ix, iy, i_total = compute_importance_lis(
-                            lis, delta_lane, lc_state
-                        )
+                        ix, iy, i_total = compute_importance_lis(lis, delta_lane, lc_state)
 
-                    # ── gate ────────────────────────────────────────────────────
+                    # ── gate ──────────────────────────────────────────────
                     if cfg.gate_theta > 0.0:
                         gate = 1.0 if i_total >= cfg.gate_theta else 0.0
                     else:
@@ -563,6 +761,8 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
             y_acc_list.append(y_acc)
             x_nb_list.append(x_nb)
             nb_mask_list.append(nb_mask)
+            x_last_abs_list.append(np.array([ref_x, ref_y], np.float32))
+            ref_heading_list.append(ref_hdg)
             trackid_list.append(int(v))
             t0_list.append(int(t0_frame))
 
@@ -580,6 +780,8 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
         "y_acc":       _safe_float(np.stack(y_acc_list,    0)),
         "x_nb":        _safe_float(np.stack(x_nb_list,     0)),
         "nb_mask":     np.stack(nb_mask_list, 0),
+        "x_last_abs":  np.stack(x_last_abs_list, 0),   # pre-normalisation position
+        "ref_heading": np.array(ref_heading_list, np.float32),  # radians
         "recordingId": np.full(n_kept, int(rec_id), dtype=np.int32),
         "trackId":     np.array(trackid_list, np.int32),
         "t0_frame":    np.array(t0_list,      np.int32),
@@ -603,6 +805,7 @@ def stage_raw2mmap(cfg: Config) -> None:
           + (f"  lis_mode : {cfg.lis_mode}" if cfg.importance_mode == 'lis' else
              f"  params   : {IMPORTANCE_PARAMS_LIT}"))
     print(f"  drop_vru        : {cfg.drop_vru}")
+    print(f"  non_relative    : {cfg.non_relative}")
 
     # ── pass 1: process all recordings in parallel ────────────────────────────
     bufs: List[Dict[str, np.ndarray]] = []
@@ -630,13 +833,14 @@ def stage_raw2mmap(cfg: Config) -> None:
 
     s0 = bufs[0]
     fp = {
-        "x_ego":      open_memmap(out / "x_ego.npy",      "w+", "float32", (total, *s0["x_ego"].shape[1:])),
-        "y":          open_memmap(out / "y.npy",           "w+", "float32", (total, *s0["y"].shape[1:])),
-        "y_vel":      open_memmap(out / "y_vel.npy",       "w+", "float32", (total, *s0["y_vel"].shape[1:])),
-        "y_acc":      open_memmap(out / "y_acc.npy",       "w+", "float32", (total, *s0["y_acc"].shape[1:])),
-        "x_nb":       open_memmap(out / "x_nb.npy",        "w+", "float32", (total, *s0["x_nb"].shape[1:])),
-        "nb_mask":    open_memmap(out / "nb_mask.npy",     "w+", "bool",    (total, *s0["nb_mask"].shape[1:])),
-        "x_last_abs": open_memmap(out / "x_last_abs.npy",  "w+", "float32", (total, 2)),
+        "x_ego":       open_memmap(out / "x_ego.npy",       "w+", "float32", (total, *s0["x_ego"].shape[1:])),
+        "y":           open_memmap(out / "y.npy",            "w+", "float32", (total, *s0["y"].shape[1:])),
+        "y_vel":       open_memmap(out / "y_vel.npy",        "w+", "float32", (total, *s0["y_vel"].shape[1:])),
+        "y_acc":       open_memmap(out / "y_acc.npy",        "w+", "float32", (total, *s0["y_acc"].shape[1:])),
+        "x_nb":        open_memmap(out / "x_nb.npy",         "w+", "float32", (total, *s0["x_nb"].shape[1:])),
+        "nb_mask":     open_memmap(out / "nb_mask.npy",      "w+", "bool",    (total, *s0["nb_mask"].shape[1:])),
+        "x_last_abs":  open_memmap(out / "x_last_abs.npy",   "w+", "float32", (total, 2)),
+        "ref_heading": open_memmap(out / "ref_heading.npy",  "w+", "float32", (total,)),
     }
     meta_rec   = np.zeros(total, np.int32)
     meta_track = np.zeros(total, np.int32)
@@ -648,10 +852,9 @@ def stage_raw2mmap(cfg: Config) -> None:
         n   = buf["x_ego"].shape[0]
         end = cursor + n
 
-        for key in ["x_ego", "y", "y_vel", "y_acc", "x_nb", "nb_mask"]:
+        for key in ["x_ego", "y", "y_vel", "y_acc", "x_nb", "nb_mask",
+                    "x_last_abs", "ref_heading"]:
             fp[key][cursor:end] = buf[key]
-
-        fp["x_last_abs"][cursor:end] = buf["x_ego"][:, -1, 0:2]
 
         meta_rec[cursor:end]   = buf["recordingId"]
         meta_track[cursor:end] = buf["trackId"]
@@ -713,14 +916,23 @@ def parse_args() -> Config:
     # gate
     ap.add_argument("--gate_theta", type=float, default=0.0,
                     help="I threshold for single-mode gate. 0.0 = legacy time-window gate")
-    ap.add_argument("--lc_version", default="v2", choices=["v1", "v2"],
-                    help="lc_state 계산 방식: v1=slot기반 절대yV | v2=dvy기반+slot/dy조합 (default)")
+    ap.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3"],
+                    help="lc_state 계산 방식: "
+                         "v1=slot기반 절대yV | "
+                         "v2=dvy기반+slot/dy조합 | "
+                         "v3=latVelocity+latLaneCenterOffset기반 (default)")
 
     # exiD-specific
     ap.add_argument("--drop_vru", action="store_true", default=True,
                     help="VRU (motorcycle/bicycle/pedestrian) 차량 관련 윈도우 제거")
     ap.add_argument("--keep_vru", action="store_true", default=False,
                     help="--drop_vru 를 무효화하고 VRU 윈도우를 포함")
+
+    # neighbor feature mode
+    ap.add_argument("--non_relative", action="store_true", default=False,
+                    help="x_nb[0:6] = neighbor's abs values in normalised frame "
+                         "(instead of ego-relative differences). "
+                         "lc_state/LIT/importance (x_nb[6:12]) always use relative values.")
 
     ap.add_argument("--dry_run", action="store_true")
 
@@ -747,6 +959,7 @@ def parse_args() -> Config:
         gate_theta      = a.gate_theta,
         lc_version    = a.lc_version,
         drop_vru    = drop_vru,
+        non_relative = a.non_relative,
         dry_run     = a.dry_run,
         num_workers = a.num_workers,
     )
