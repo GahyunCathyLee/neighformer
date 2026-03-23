@@ -208,6 +208,9 @@ class Config:
     # lc_state version
     lc_version: str = "v2"           # "v1" (slot-based, tf_trajPred) | "v2" (dy-sign-based, neighformer)
 
+    # neighbor feature mode
+    non_relative: bool = False  # True → x_nb[0:6] = nb's abs values in globally-shifted frame
+
     # output / execution
     dry_run:     bool = False
     num_workers: int  = 0   # 0 = os.cpu_count()
@@ -416,6 +419,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     y_acc_list:      List[np.ndarray] = []
     x_nb_list:       List[np.ndarray] = []
     nb_mask_list:    List[np.ndarray] = []
+    x_last_abs_list: List[np.ndarray] = []
     trackid_list:    List[int] = []
     t0_list:         List[int] = []
 
@@ -448,11 +452,15 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
             ego_lane_arr = lane_id[ego_rows].astype(np.int32)
 
+            # ── ego-centric normalisation: last history frame as origin ───────
+            ref_x = float(ex[-1])
+            ref_y = float(ey[-1])
+
             x_ego = np.stack(
-                [ex, ey, exv, eyv, exa, eya], axis=1
+                [ex - ref_x, ey - ref_y, exv, eyv, exa, eya], axis=1
             ).astype(np.float32)
 
-            y_fut = np.stack([x[fut_rows],  y[fut_rows]],  axis=1).astype(np.float32)
+            y_fut = np.stack([x[fut_rows] - ref_x, y[fut_rows] - ref_y], axis=1).astype(np.float32)
             y_vel = np.stack([xv[fut_rows], yv[fut_rows]], axis=1).astype(np.float32)
             y_acc = np.stack([xa[fut_rows], ya[fut_rows]], axis=1).astype(np.float32)
 
@@ -474,7 +482,12 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
                     nb_vec = np.array([x[r], y[r], xv[r], yv[r], xa[r], ya[r]], np.float32)
                     rel    = nb_vec - ego_vec
-                    x_nb[ti, ki, 0:6] = rel
+                    if cfg.non_relative:
+                        x_nb[ti, ki, 0:6] = np.array(
+                            [x[r] - ref_x, y[r] - ref_y, xv[r], yv[r], xa[r], ya[r]], np.float32
+                        )
+                    else:
+                        x_nb[ti, ki, 0:6] = rel
                     nb_mask[ti, ki]   = True
 
                     # ── lc_state v1: slot-based, 현재 프레임 절대 yVelocity (tf_trajPred 방식) ──
@@ -558,6 +571,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
             y_acc_list.append(y_acc)
             x_nb_list.append(x_nb)
             nb_mask_list.append(nb_mask)
+            x_last_abs_list.append(np.array([ref_x, ref_y], np.float32))
             trackid_list.append(int(v))
             t0_list.append(int(t0_frame))
 
@@ -569,12 +583,13 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
     n_kept = len(x_ego_list)
     return {
-        "x_ego":       _safe_float(np.stack(x_ego_list,   0)),
-        "y":           _safe_float(np.stack(y_fut_list,    0)),
-        "y_vel":       _safe_float(np.stack(y_vel_list,    0)),
-        "y_acc":       _safe_float(np.stack(y_acc_list,    0)),
-        "x_nb":        _safe_float(np.stack(x_nb_list,     0)),
+        "x_ego":       _safe_float(np.stack(x_ego_list,    0)),
+        "y":           _safe_float(np.stack(y_fut_list,     0)),
+        "y_vel":       _safe_float(np.stack(y_vel_list,     0)),
+        "y_acc":       _safe_float(np.stack(y_acc_list,     0)),
+        "x_nb":        _safe_float(np.stack(x_nb_list,      0)),
         "nb_mask":     np.stack(nb_mask_list, 0),
+        "x_last_abs":  np.stack(x_last_abs_list, 0),
         "recordingId": np.full(n_kept, int(rec_id), dtype=np.int32),
         "trackId":     np.array(trackid_list, np.int32),
         "t0_frame":    np.array(t0_list,      np.int32),
@@ -642,10 +657,8 @@ def stage_raw2mmap(cfg: Config) -> None:
         n   = buf["x_ego"].shape[0]
         end = cursor + n
 
-        for key in ["x_ego", "y", "y_vel", "y_acc", "x_nb", "nb_mask"]:
+        for key in ["x_ego", "y", "y_vel", "y_acc", "x_nb", "nb_mask", "x_last_abs"]:
             fp[key][cursor:end] = buf[key]
-
-        fp["x_last_abs"][cursor:end] = buf["x_ego"][:, -1, 0:2]
 
         meta_rec[cursor:end]   = buf["recordingId"]
         meta_track[cursor:end] = buf["trackId"]
@@ -727,6 +740,11 @@ def parse_args() -> Config:
                          "v1=slot기반 절대yV (tf_trajPred 방식, 값범주 {-3,-2,-1,0,1,2,3}), "
                          "v2=dvy기반+slot/dy조합 (neighformer 방식, 값범주 {0,1,2}, default)")
 
+    ap.add_argument("--non_relative", action="store_true", default=False,
+                    help="x_nb[0:6] = neighbor's abs values in globally-shifted frame "
+                         "(instead of ego-relative differences). "
+                         "lc_state/LIT/importance (x_nb[6:12]) always use relative values.")
+
     ap.add_argument("--dry_run", action="store_true")
 
     a = ap.parse_args()
@@ -750,6 +768,7 @@ def parse_args() -> Config:
         importance_mode = a.importance_mode,
         gate_theta      = a.gate_theta,
         lc_version    = a.lc_version,
+        non_relative = a.non_relative,
         dry_run     = a.dry_run,
         num_workers = a.num_workers,
     )
