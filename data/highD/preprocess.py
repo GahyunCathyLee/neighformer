@@ -206,7 +206,7 @@ class Config:
     gate_theta: float = 0.0   # I threshold (single-mode); 0.0 = legacy time-window gate
 
     # lc_state version
-    lc_version: str = "v2"           # "v1" (slot-based, tf_trajPred) | "v2" (dy-sign-based, neighformer)
+    lc_version: str = "v3"           # "v1" (slot-based) | "v2" (dy-sign-based) | "v3" (latV+lco-based)
 
     # neighbor feature mode
     non_relative: bool = False  # True → x_nb[0:6] = nb's abs values in globally-shifted frame
@@ -380,6 +380,37 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     dd      = np.array([vid_to_dd.get(int(v), 0) for v in vid], np.int8)
     x_max   = float(np.nanmax(x)) if len(x) else 0.0
 
+    # lat lane center offset (v3 lc_state) – computed in pre-flip coordinates
+    # upper_mark[j] = boundary between Lane(j+1) and Lane(j+2)  (j = 0..N_upper-2)
+    # lower_mark[j] = boundary between Lane(N_upper+j) and Lane(N_upper+j+1)
+    # Lane1 (outermost upper, lid=1) and outermost lower lane are edge lanes → offset=0
+    _N_upper = len(upper_mark)
+    lat_lane_offset_arr = np.zeros(len(y), np.float32)
+
+    _lid_arr = lane_id.astype(np.int32)
+
+    # lower-direction vehicles (dd==2): j = lid - N_upper - 2
+    # (Lane N_upper+1 = central reservation has no track data but consumes one lane ID)
+    _mask_lo = (dd == 2)
+    _j_lo    = _lid_arr - _N_upper - 2
+    _ok_lo   = _mask_lo & (_j_lo >= 0) & (_j_lo < len(lower_mark) - 1)
+    lat_lane_offset_arr[_ok_lo] = (
+        y[_ok_lo]
+        - 0.5 * (lower_mark[_j_lo[_ok_lo]] + lower_mark[_j_lo[_ok_lo] + 1])
+    )
+
+    # upper-direction vehicles (dd==1): j = lid - 2  (Lane1 → j=-1 → invalid)
+    _mask_up = (dd == 1)
+    _j_up    = _lid_arr - 2
+    _ok_up   = _mask_up & (_j_up >= 0) & (_j_up < len(upper_mark) - 1)
+    lat_lane_offset_arr[_ok_up] = (
+        y[_ok_up]
+        - 0.5 * (upper_mark[_j_up[_ok_up]] + upper_mark[_j_up[_ok_up] + 1])
+    )
+
+    # maybe_flip negates y for upper vehicles → negate lco to match
+    lat_lane_offset_arr[dd == 1] *= -1.0
+
     if cfg.normalize_upper_xy:
         x, y, xv, yv, xa, ya, lane_id = maybe_flip(
             x, y, xv, yv, xa, ya, lane_id, dd, C_y, x_max, upper_mm
@@ -490,8 +521,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                         x_nb[ti, ki, 0:6] = rel
                     nb_mask[ti, ki]   = True
 
-                    # ── lc_state v1: slot-based, 현재 프레임 절대 yVelocity (tf_trajPred 방식) ──
-                    # ── lc_state v2: dvy-based, slot+dy 조합                  (neighformer 방식) ──
+                    # ── lc_state ─────────────────────────────────────────────
                     if cfg.lc_version == "v1":
                         vyn = float(yv[r])
                         if ki < 2:                          # same-lane lead / rear
@@ -504,7 +534,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                             if   vyn < -cfg.vy_eps: lc_state =  1.0  # toward ego lane
                             elif vyn >  cfg.vy_eps: lc_state =  3.0  # away from ego lane
                             else:                   lc_state =  2.0  # staying
-                    else:                                   # v2 (default)
+                    elif cfg.lc_version == "v2":
                         dy      = float(rel[1])
                         dvy     = float(rel[3])
                         abs_dvy = abs(dvy)
@@ -524,6 +554,27 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                         else:
                             # Case 3: same-lane slot (0/1) but |dy|>=dy_same → transitioning
                             lc_state = 0.0 if dy * dvy < 0 else 2.0
+                    else:  # v3 (default)
+                        nb_lat_v = float(yv[r])
+                        nb_lco   = float(lat_lane_offset_arr[r])
+                        if ki < 2:   # same lane (lead / rear)
+                            if (nb_lco < -1.0 and nb_lat_v > 0.0) or \
+                               (nb_lco >  1.0 and nb_lat_v < 0.0):
+                                lc_state = 0.0
+                            elif (nb_lco < -1.0 and nb_lat_v < 0.0) or \
+                                 (nb_lco >  1.0 and nb_lat_v > 0.0) or \
+                                 abs(nb_lat_v) > 0.029:
+                                lc_state = 2.0
+                            else:
+                                lc_state = 1.0
+                        elif ki < 5:  # left lane (slots 2,3,4)
+                            if   nb_lat_v < -0.029: lc_state = 0.0
+                            elif nb_lat_v >  0.029: lc_state = 2.0
+                            else:                   lc_state = 1.0
+                        else:         # right lane (slots 5,6,7)
+                            if   nb_lat_v < -0.029: lc_state = 2.0
+                            elif nb_lat_v >  0.029: lc_state = 0.0
+                            else:                   lc_state = 1.0
 
                     dx  = float(rel[0])
                     dvx = float(rel[2])
@@ -713,7 +764,7 @@ def parse_args() -> Config:
                     help="lc_state v2: |dy| < dy_same means same-lane for slot 0/1")
 
     # LIS
-    ap.add_argument("--lis_mode", default="9",
+    ap.add_argument("--lis_mode", default="7",
                     choices=["3", "5", "7", "9"],
                     help=(
                         "LIS binning mode (used when importance_mode=lis): "
@@ -735,10 +786,11 @@ def parse_args() -> Config:
     # gate
     ap.add_argument("--gate_theta", type=float, default=0.0,
                     help="I threshold for single-mode (P85). 0.0 = legacy time-window gate")
-    ap.add_argument("--lc_version", default="v2", choices=["v1", "v2"],
+    ap.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3"],
                     help="lc_state 계산 방식: "
                          "v1=slot기반 절대yV (tf_trajPred 방식, 값범주 {-3,-2,-1,0,1,2,3}), "
-                         "v2=dvy기반+slot/dy조합 (neighformer 방식, 값범주 {0,1,2}, default)")
+                         "v2=dvy기반+slot/dy조합 (neighformer 방식, 값범주 {0,1,2}), "
+                         "v3=latVelocity+latLaneCenterOffset기반 (default, 값범주 {0,1,2})")
 
     ap.add_argument("--non_relative", action="store_true", default=False,
                     help="x_nb[0:6] = neighbor's abs values in globally-shifted frame "

@@ -198,7 +198,7 @@ class Config:
     gate_theta: float = 0.0   # 0.0 = legacy time-window gate
 
     # lc_state version
-    lc_version: str = "v3"    # "v1" | "v2" | "v3"
+    lc_version: str = "v2"    # "v1" | "v2"
 
     # exiD-specific: VRU 필터링
     drop_vru: bool = True     # VRU (motorcycle/bicycle/pedestrian) 윈도우 제거
@@ -451,13 +451,6 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     ya      = tracks["latAcceleration"].astype(np.float32).to_numpy()
     lane_id = tracks["laneletId"].fillna(-1).astype(np.int32).to_numpy()
 
-    # latLaneCenterOffset (first semicolon-separated value per row)
-    if "latLaneCenterOffset" in tracks.columns:
-        _lco_s = tracks["latLaneCenterOffset"].astype(str).str.strip().str.split(";").str[0]
-        lat_lane_offset_arr = pd.to_numeric(_lco_s, errors="coerce").fillna(0.0).astype(np.float32).to_numpy()
-    else:
-        lat_lane_offset_arr = np.zeros(len(tracks), np.float32)
-
     # heading (degrees in CSV → radians for computation)
     heading_deg = (tracks["heading"].astype(np.float32).to_numpy()
                    if "heading" in tracks.columns
@@ -670,7 +663,16 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     x_nb[ti, ki, 5] = f_day
                     nb_mask[ti, ki] = True
 
-                    # ── lc_state ─────────────────────────────────────────
+                    # ── lc_state: center-to-center dy/dvy in ego frame ────
+                    _, dy_cc  = _rot2d(
+                        float(x[r]) - float(ex[ti]),
+                        float(y[r]) - float(ey[ti]),
+                        ego_hdg_ti,
+                    )
+                    # dvy in ego frame = lateral component of dvx_rel, dvy_rel
+                    # (already in ego frame, so dvy_rel is the lateral relative vel)
+                    dvy_cc = dvy_rel
+
                     if cfg.lc_version == "v1":
                         vyn = float(yv[r])
                         if ki < 2:
@@ -683,13 +685,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                             if   vyn < -0.27: lc_state =  1.0
                             elif vyn >  0.27: lc_state =  3.0
                             else:             lc_state =  2.0
-                    elif cfg.lc_version == "v2":
-                        _, dy_cc = _rot2d(
-                            float(x[r]) - float(ex[ti]),
-                            float(y[r]) - float(ey[ti]),
-                            ego_hdg_ti,
-                        )
-                        dvy_cc     = dvy_rel
+                    else:   # v2 (default)
                         abs_dvy_cc = abs(dvy_cc)
                         if ki < 2 and abs(dy_cc) < cfg.dy_same:
                             lc_state = 2.0 if abs_dvy_cc > cfg.dvy_eps_same else 1.0
@@ -700,27 +696,6 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                                 lc_state = 1.0
                         else:
                             lc_state = 0.0 if dy_cc * dvy_cc < 0 else 2.0
-                    else:  # v3 (default)
-                        nb_lat_v = float(yv[r])
-                        nb_lco   = float(lat_lane_offset_arr[r])
-                        if ki < 2:   # same lane (leadId, rearId)
-                            if (nb_lco < -1.0 and nb_lat_v > 0.0) or \
-                               (nb_lco >  1.0 and nb_lat_v < 0.0):
-                                lc_state = 0.0
-                            elif (nb_lco < -1.0 and nb_lat_v < 0.0) or \
-                                 (nb_lco >  1.0 and nb_lat_v > 0.0) or \
-                                 abs(nb_lat_v) > 0.029:
-                                lc_state = 2.0
-                            else:
-                                lc_state = 1.0
-                        elif ki < 5:  # left lane (leftLeadId, leftAlongsideId, leftRearId)
-                            if   nb_lat_v < -0.029: lc_state = 0.0
-                            elif nb_lat_v >  0.029: lc_state = 2.0
-                            else:                   lc_state = 1.0
-                        else:         # right lane (rightLeadId, rightAlongsideId, rightRearId)
-                            if   nb_lat_v < -0.029: lc_state = 2.0
-                            elif nb_lat_v >  0.029: lc_state = 0.0
-                            else:                   lc_state = 1.0
 
                     # ── LIT: key-point dx, relative dvx in ego frame ──────
                     # dx_key is already edge-to-edge for lead/rear slots
@@ -916,11 +891,8 @@ def parse_args() -> Config:
     # gate
     ap.add_argument("--gate_theta", type=float, default=0.0,
                     help="I threshold for single-mode gate. 0.0 = legacy time-window gate")
-    ap.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3"],
-                    help="lc_state 계산 방식: "
-                         "v1=slot기반 절대yV | "
-                         "v2=dvy기반+slot/dy조합 | "
-                         "v3=latVelocity+latLaneCenterOffset기반 (default)")
+    ap.add_argument("--lc_version", default="v2", choices=["v1", "v2"],
+                    help="lc_state 계산 방식: v1=slot기반 절대yV | v2=dvy기반+slot/dy조합 (default)")
 
     # exiD-specific
     ap.add_argument("--drop_vru", action="store_true", default=True,
