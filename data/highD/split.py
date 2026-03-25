@@ -40,6 +40,9 @@ Usage examples
   # No scenario split (random)
   python split.py --stratify none
 
+  # Train만 stratify, val/test는 random (train-only 모드)
+  python split.py --stratify combined --no_stratify_eval
+
   # Custom paths
   python split.py \\
       --label_file data/highD/mmap/scenario_labels.csv \\
@@ -131,12 +134,17 @@ def scenario_split(
     train_ratio: float,
     val_ratio: float,
     seed: int,
+    stratify_eval: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Track 단위 Stratified Split.
     같은 track의 window가 split 경계를 넘지 않도록 보장합니다.
+
+    stratify_eval=False 이면 train만 stratified split하고,
+    val/test는 나머지 track을 단순 random 분할합니다.
     """
-    print(f"\n[Scenario-based split  |  stratify={stratify_mode}]")
+    eval_tag = "" if stratify_eval else "  |  eval=random"
+    print(f"\n[Scenario-based split  |  stratify={stratify_mode}{eval_tag}]")
 
     # ── 필요한 컬럼 확인 ───────────────────────────────────────────────────────
     if stratify_mode in ("event", "combined") and "event_label" not in df.columns:
@@ -166,7 +174,12 @@ def scenario_split(
 
     train_tracks, temp_tracks = _split(track_df, test_size=1.0 - train_ratio)
     val_frac = val_ratio / (1.0 - train_ratio)
-    val_tracks, test_tracks   = _split(temp_tracks, test_size=1.0 - val_frac)
+    if stratify_eval:
+        val_tracks, test_tracks = _split(temp_tracks, test_size=1.0 - val_frac)
+    else:
+        val_tracks, test_tracks = train_test_split(
+            temp_tracks, test_size=1.0 - val_frac, stratify=None, random_state=seed
+        )
 
     def _flatten(subset: pd.DataFrame) -> np.ndarray:
         return np.array(sorted(idx for idxs in subset["indices"] for idx in idxs))
@@ -256,6 +269,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    # ── eval stratification ───────────────────────────────────────────────────
+    ap.add_argument(
+        "--no_stratify_eval",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, only train is stratified by scenario; "
+            "val and test are split randomly from the remaining tracks."
+        ),
+    )
+
     # ── misc ──────────────────────────────────────────────────────────────────
     ap.add_argument("--seed", type=int, default=SEED, help="Random seed")
 
@@ -285,7 +309,7 @@ def main() -> None:
         f"[INFO] Ratios   train={train_ratio:.3f}  "
         f"val={val_ratio:.3f}  test={test_ratio:.3f}"
     )
-    print(f"[INFO] Stratify : {args.stratify}")
+    print(f"[INFO] Stratify : {args.stratify}  (eval={'random' if args.no_stratify_eval else 'stratified'})")
 
     # ── load label file ───────────────────────────────────────────────────────
     label_path = Path(args.label_file)
@@ -303,7 +327,8 @@ def main() -> None:
         )
     else:
         train_idx, val_idx, test_idx = scenario_split(
-            df, args.stratify, train_ratio, val_ratio, args.seed
+            df, args.stratify, train_ratio, val_ratio, args.seed,
+            stratify_eval=not args.no_stratify_eval,
         )
 
     # ── label distribution summary ────────────────────────────────────────────
