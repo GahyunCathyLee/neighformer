@@ -23,7 +23,7 @@ x_nb   : (N, T, K, 13)   ego-relative neighbor features
     idx  6  lc_state  lane-change state  {0: closing in, 1: stay, 2: moving out}
     idx  7  lit       Longitudinal Interaction Time  dx / (dvx ± eps)
     idx  8  lis       Longitudinal Interaction State (binned lit)
-    idx  9  gate      1 if (I_x >= theta_x) OR (I_y >= theta_y) else 0  [theta = P85]
+    idx  9  gate      1 if neighbor is active (gate_theta threshold or top-N selection)
     idx 10  I_x       longitudinal importance
     idx 11  I_y       lateral importance
     idx 12  I         composite importance  sqrt((I_x^2 + I_y^2) / 2)
@@ -108,6 +108,24 @@ NEIGHBOR_COLS_8 = [
 EGO_DIM = 6    # x, y, xV, yV, xA, yA
 NB_DIM  = 13   # dx, dy, dvx, dvy, dax, day, lc_state, lit, lis, gate, I_x, I_y, I
 K       = 8    # neighbor slots
+
+# Slot priority for top-N gate tie-breaking: 0 > 2 > 5 > 1 > 4 > 7 > 3 > 6
+_TOPN_SLOT_PRIORITY = {s: r for r, s in enumerate([0, 2, 5, 1, 4, 7, 3, 6])}
+
+
+def _apply_topn_gate(nb_row: np.ndarray, mask_row: np.ndarray, n: int) -> None:
+    """Select top-n slots by I (idx 12) and zero-gate the rest (in-place).
+    Tie-breaking: slot priority 0>2>5>1>4>7>3>6.
+    """
+    K_local = nb_row.shape[0]
+    valid = [k for k in range(K_local) if mask_row[k]]
+    valid.sort(key=lambda k: (-nb_row[k, 12], _TOPN_SLOT_PRIORITY.get(k, K_local)))
+    selected = set(valid[:n])
+    for k in valid:
+        if k not in selected:
+            nb_row[k, 9]  = 0.0
+            nb_row[k, 12] = 0.0
+
 
 # exiD 기본 프레임레이트 (recordingMeta에 frameRate 컬럼이 없을 경우 fallback)
 EXID_DEFAULT_HZ = 25.0
@@ -195,7 +213,8 @@ class Config:
     importance_mode: str = 'lis'  # 'lis' | 'lit'
 
     # importance gate
-    gate_theta: float = 0.0   # 0.0 = legacy time-window gate
+    gate_theta: float = 0.0   # 0.0 = no threshold (all gates=1)
+    gate_topn:  int   = 0     # >0 = keep top-N slots by I; 0 = disabled
 
     # lc_state version
     lc_version: str = "v3"    # "v1" | "v2" | "v3" | "v4" (lco_norm-based)
@@ -764,7 +783,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     if cfg.gate_theta > 0.0:
                         gate = 1.0 if i_total >= cfg.gate_theta else 0.0
                     else:
-                        gate = 1.0 if (-cfg.t_back < lit < cfg.t_front) else 0.0
+                        gate = 1.0  # gate_topn post-processing or all-active default
 
                     x_nb[ti, ki, 6]  = lc_state
                     x_nb[ti, ki, 7]  = lit
@@ -774,6 +793,10 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     x_nb[ti, ki, 10] = ix
                     x_nb[ti, ki, 11] = iy
                     x_nb[ti, ki, 12] = i_total
+
+                # ── top-N gate (applied after all slots are filled) ────
+                if cfg.gate_topn > 0:
+                    _apply_topn_gate(x_nb[ti], nb_mask[ti], cfg.gate_topn)
 
             x_ego_list.append(x_ego)
             y_fut_list.append(y_fut)
@@ -935,7 +958,10 @@ def parse_args() -> Config:
 
     # gate
     ap.add_argument("--gate_theta", type=float, default=0.0,
-                    help="I threshold for single-mode gate. 0.0 = legacy time-window gate")
+                    help="I threshold gate: gate=1 if I>=theta. 0.0 = all gates active (default)")
+    ap.add_argument("--gate_topn", type=int, default=0,
+                    help="Top-N gate: keep up to N slots with highest I; "
+                         "tie-break by slot priority 0>2>5>1>4>7>3>6. 0 = disabled")
     ap.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3", "v4"],
                     help="lc_state 계산 방식: "
                          "v1=slot기반 절대yV | "
@@ -978,6 +1004,7 @@ def parse_args() -> Config:
         lis_mode        = a.lis_mode,
         importance_mode = a.importance_mode,
         gate_theta      = a.gate_theta,
+        gate_topn       = a.gate_topn,
         lc_version    = a.lc_version,
         drop_vru    = drop_vru,
         non_relative = a.non_relative,
