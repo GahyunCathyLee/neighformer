@@ -73,17 +73,19 @@ def load_mmap(mmap_dir: Path):
     return x_nb, nb_mask
 
 
-def compute_max_I_per_slot(x_nb: np.ndarray, nb_mask: np.ndarray) -> np.ndarray:
+def compute_I(x_nb: np.ndarray, nb_mask: np.ndarray):
     """
-    각 sample × slot에 대해, 전체 히스토리 T에 걸친 최대 I 값을 계산.
+    전체 (N, T, K) I 값과 슬롯별 최대 I 값을 계산.
 
     Returns
     -------
-    max_I : np.ndarray, shape (N, K)
-        존재하지 않는 슬롯(nb_mask 전부 False)은 0.0
+    I_vals : np.ndarray, shape (N, T, K)
+        존재하지 않는 timestep은 0.0
+    max_I  : np.ndarray, shape (N, K)
+        각 슬롯에서 T 방향 최댓값
     """
     N, T, K_dim = nb_mask.shape
-    print(f"[Compute] max I per slot  (N={N}, T={T}, K={K_dim}) ...")
+    print(f"[Compute] I values  (N={N}, T={T}, K={K_dim}) ...")
 
     # raw I 계산: sqrt((Ix^2 + Iy^2) / 2), gate 적용 전
     ix = x_nb[:, :, :, IDX_IX].astype(np.float32)
@@ -91,11 +93,12 @@ def compute_max_I_per_slot(x_nb: np.ndarray, nb_mask: np.ndarray) -> np.ndarray:
     I_vals = np.sqrt((ix ** 2 + iy ** 2) / 2.0)        # (N, T, K)
 
     # 존재하지 않는 timestep은 0으로 마스킹
-    I_vals = I_vals * nb_mask.astype(np.float32)        # broadcast (N,T,K)
+    mask_f = nb_mask.astype(np.float32)
+    I_vals = I_vals * mask_f                            # (N, T, K)
 
     # 각 (N, K) 슬롯에서 T 방향 최댓값
     max_I = I_vals.max(axis=1)   # (N, K)
-    return max_I
+    return I_vals, max_I
 
 
 def active_neighbor_count(max_I: np.ndarray, theta: float) -> np.ndarray:
@@ -232,12 +235,13 @@ def main():
     # ── 1. 데이터 로드 ────────────────────────────────────────────────────────
     x_nb, nb_mask = load_mmap(mmap_dir)
 
-    # ── 2. 슬롯별 최대 I 계산 ─────────────────────────────────────────────────
-    max_I = compute_max_I_per_slot(x_nb, nb_mask)   # (N, K)
+    # ── 2. I 계산 ─────────────────────────────────────────────────────────────
+    I_vals, max_I = compute_I(x_nb, nb_mask)   # (N, T, K), (N, K)
 
-    # 전체 I 분포 요약
-    all_vals = max_I.ravel()
-    print(f"\n[I distribution (all max-per-slot, including zero)]")
+    # 전체 I 분포 요약 (유효한 neighbor timestep만)
+    all_vals = I_vals[nb_mask.astype(bool)]   # 1D, masked
+    print(f"\n[I distribution (all valid neighbor timesteps, N×T×K masked)]")
+    print(f"  Total valid entries: {len(all_vals):,}")
     for pct in [0.0, 0.1, 12.5, 25, 37.5, 50, 62.5, 75, 87.5, 90, 95, 99]:
         print(f"  P{pct:>2.1f}: {np.percentile(all_vals, pct):.4f}")
     print(f"  Max: {all_vals.max():.4f}")
