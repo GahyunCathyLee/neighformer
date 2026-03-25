@@ -148,25 +148,51 @@ def _process_exid_rec(args: Tuple[str, str]) -> Tuple[str, Dict[str, Dict[str, L
     tracks = tracks.sort_values(["trackId", "frame"], kind="mergesort").reset_index(drop=True)
 
     frame_arr = tracks["frame"].to_numpy(np.int32)
-    lane_arr  = (tracks["laneletId"].fillna(-1).astype(np.int32).to_numpy()
-                 if "laneletId" in tracks.columns
-                 else np.full(len(tracks), -1, np.int32))
 
-    if "latLaneCenterOffset" in tracks.columns:
+    # laneletId: 여러 lanelet에 걸쳐 있을 때 "123;456" 형태 → 첫 번째 값 사용
+    # (int 변환 실패로 -1이 되면 LC 이벤트 검출이 누락됨)
+    if "laneletId" in tracks.columns:
+        _s = tracks["laneletId"].astype(str).str.strip().str.split(";").str[0]
+        lane_arr = pd.to_numeric(_s, errors="coerce").fillna(-1).astype(np.int32).to_numpy()
+    else:
+        lane_arr = np.full(len(tracks), -1, np.int32)
+
+    # latLaneCenterOffset & laneWidth: 여러 값이 있을 때 |lco|가 최대인 lanelet의 값 사용
+    # (lco와 laneWidth는 같은 인덱스 lanelet 것을 사용해야 올바르게 normalize됨)
+    if "latLaneCenterOffset" in tracks.columns and "laneWidth" in tracks.columns:
+        lco_raw = tracks["latLaneCenterOffset"].astype(str).tolist()
+        lw_raw  = tracks["laneWidth"].astype(str).tolist()
+        lco_lw_pairs: List[Tuple[float, float]] = []
+        for lco_s, lw_s in zip(lco_raw, lw_raw):
+            lcos = [float(v) for v in lco_s.strip().split(";") if v.strip() not in ("", "nan")]
+            lws  = [float(v) for v in lw_s.strip().split(";")  if v.strip() not in ("", "nan")]
+            if not lcos:
+                lco_lw_pairs.append((0.0, 3.5))
+                continue
+            idx  = max(range(len(lcos)), key=lambda i: abs(lcos[i]))
+            lco  = lcos[idx]
+            lw   = lws[idx] if idx < len(lws) else (lws[0] if lws else 3.5)
+            if not (lw > 0):
+                lw = 3.5
+            lco_lw_pairs.append((lco, lw))
+        lco_arr = np.array([p[0] for p in lco_lw_pairs], np.float32)
+        lw_arr  = np.array([p[1] for p in lco_lw_pairs], np.float32)
+    elif "latLaneCenterOffset" in tracks.columns:
         _s = tracks["latLaneCenterOffset"].astype(str).str.strip().str.split(";").str[0]
         lco_arr = pd.to_numeric(_s, errors="coerce").fillna(0.0).to_numpy(np.float32)
+        lw_arr  = np.full(len(tracks), 3.5, np.float32)
     else:
         lco_arr = np.zeros(len(tracks), np.float32)
-
-    if "laneWidth" in tracks.columns:
-        _s = tracks["laneWidth"].astype(str).str.strip().str.split(";").str[0]
-        lw_arr = pd.to_numeric(_s, errors="coerce").fillna(3.5).to_numpy(np.float32)
-    else:
-        lw_arr = np.full(len(tracks), 3.5, np.float32)
+        lw_arr  = np.full(len(tracks), 3.5, np.float32)
 
     lat_v_arr = (tracks["latVelocity"].to_numpy(np.float32)
                  if "latVelocity" in tracks.columns
                  else np.zeros(len(tracks), np.float32))
+
+    # laneChange 컬럼: exiD 어노테이션 기반 LC 이벤트 (laneletId 변화보다 훨씬 정확)
+    has_lc_col = "laneChange" in tracks.columns
+    if has_lc_col:
+        lc_col_arr = (tracks["laneChange"].fillna(0).astype(np.int32).to_numpy())
 
     per_vid_rows: Dict[int, np.ndarray] = {}
     per_vid_f2r:  Dict[int, Dict[int, int]] = {}
@@ -177,9 +203,15 @@ def _process_exid_rec(args: Tuple[str, str]) -> Tuple[str, Dict[str, Dict[str, L
 
     lc_frames: Dict[int, np.ndarray] = {}
     for v, idxs in per_vid_rows.items():
-        lids = lane_arr[idxs]
-        chg  = np.where((lids[1:] != lids[:-1]) & (lids[1:] >= 0) & (lids[:-1] >= 0))[0] + 1
-        lc_frames[v] = frame_arr[idxs[chg]] if len(chg) else np.array([], np.int32)
+        if has_lc_col:
+            # laneChange != 0인 연속 구간의 첫 번째 프레임을 LC 이벤트로 사용
+            mask   = lc_col_arr[idxs] != 0
+            starts = np.where(mask & ~np.concatenate([[False], mask[:-1]]))[0]
+            lc_frames[v] = frame_arr[idxs[starts]] if len(starts) else np.array([], np.int32)
+        else:
+            lids = lane_arr[idxs]
+            chg  = np.where((lids[1:] != lids[:-1]) & (lids[1:] >= 0) & (lids[:-1] >= 0))[0] + 1
+            lc_frames[v] = frame_arr[idxs[chg]] if len(chg) else np.array([], np.int32)
 
     result = empty_result()
     n_samples = 0
@@ -384,7 +416,7 @@ def print_stats(data: Dict[str, Dict[str, List[float]]], label: str) -> None:
     print(f"\n{'='*60}")
     print(f"  {label}  lco_norm 통계  (signed)")
     print(f"{'='*60}")
-    print(f"  {'window':<14} {'N':>7}  {'min':>7}  {'max':>7}  {'mean':>6}  {'std':>6}  {'p50':>6}  {'p75':>6}  {'p90':>6}  {'p95':>6}")
+    print(f"  {'window':<14} {'N':>7}  {'min':>7}  {'max':>7}  {'mean':>6}  {'std':>6}  {'p50':>6}  {'p75':>6}  {'p90':>6}  {'p99':>6}")
     print(f"  {'-'*84}")
     for wkey in ALL_WINDOW_KEYS:
         arr = np.array(data[wkey]["lco_norm"], np.float32)
@@ -393,10 +425,10 @@ def print_stats(data: Dict[str, Dict[str, List[float]]], label: str) -> None:
         print(f"  {wkey:<14}  {len(arr):>7,}  {arr.min():>7.3f}  {arr.max():>7.3f}  "
               f"{arr.mean():>6.3f}  {arr.std():>6.3f}  "
               f"{np.percentile(arr,50):>6.3f}  {np.percentile(arr,75):>6.3f}  "
-              f"{np.percentile(arr,90):>6.3f}  {np.percentile(arr,95):>6.3f}")
+              f"{np.percentile(arr,90):>6.3f}  {np.percentile(arr,99):>6.3f}")
 
     print(f"\n  {label}  |lco_norm| 통계")
-    print(f"  {'window':<14} {'N':>7}  {'min':>7}  {'max':>7}  {'mean':>6}  {'std':>6}  {'p50':>6}  {'p75':>6}  {'p90':>6}  {'p95':>6}")
+    print(f"  {'window':<14} {'N':>7}  {'min':>7}  {'max':>7}  {'mean':>6}  {'std':>6}  {'p50':>6}  {'p75':>6}  {'p90':>6}  {'p99':>6}")
     print(f"  {'-'*84}")
     for wkey in ALL_WINDOW_KEYS:
         arr = np.abs(np.array(data[wkey]["lco_norm"], np.float32))
@@ -405,10 +437,10 @@ def print_stats(data: Dict[str, Dict[str, List[float]]], label: str) -> None:
         print(f"  {wkey:<14}  {len(arr):>7,}  {arr.min():>7.3f}  {arr.max():>7.3f}  "
               f"{arr.mean():>6.3f}  {arr.std():>6.3f}  "
               f"{np.percentile(arr,50):>6.3f}  {np.percentile(arr,75):>6.3f}  "
-              f"{np.percentile(arr,90):>6.3f}  {np.percentile(arr,95):>6.3f}")
+              f"{np.percentile(arr,90):>6.3f}  {np.percentile(arr,99):>6.3f}")
 
     print(f"\n  {label}  |latVelocity| 통계")
-    print(f"  {'window':<14} {'N':>7}  {'mean':>6}  {'std':>6}  {'p50':>6}  {'p75':>6}  {'p90':>6}")
+    print(f"  {'window':<14} {'N':>7}  {'mean':>6}  {'std':>6}  {'p50':>6}  {'p75':>6}  {'p90':>6}  {'p99':>6}")
     print(f"  {'-'*64}")
     for wkey in ALL_WINDOW_KEYS:
         arr = np.abs(np.array(data[wkey]["lat_v"], np.float32))
@@ -416,7 +448,7 @@ def print_stats(data: Dict[str, Dict[str, List[float]]], label: str) -> None:
             continue
         print(f"  {wkey:<14}  {len(arr):>7,}  {arr.mean():>6.3f}  {arr.std():>6.3f}  "
               f"{np.percentile(arr,50):>6.3f}  {np.percentile(arr,75):>6.3f}  "
-              f"{np.percentile(arr,90):>6.3f}")
+              f"{np.percentile(arr,90):>6.3f}  {np.percentile(arr,99):>6.3f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
