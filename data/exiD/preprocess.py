@@ -198,7 +198,7 @@ class Config:
     gate_theta: float = 0.0   # 0.0 = legacy time-window gate
 
     # lc_state version
-    lc_version: str = "v3"    # "v1" | "v2" | "v3"
+    lc_version: str = "v3"    # "v1" | "v2" | "v3" | "v4" (lco_norm-based)
 
     # exiD-specific: VRU 필터링
     drop_vru: bool = True     # VRU (motorcycle/bicycle/pedestrian) 윈도우 제거
@@ -458,6 +458,13 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     else:
         lat_lane_offset_arr = np.zeros(len(tracks), np.float32)
 
+    # lane width array (v4 lc_state용 lco_norm 계산)
+    if "laneWidth" in tracks.columns:
+        _lw_s = tracks["laneWidth"].astype(str).str.strip().str.split(";").str[0]
+        lat_lane_width_arr = pd.to_numeric(_lw_s, errors="coerce").fillna(3.5).astype(np.float32).to_numpy()
+    else:
+        lat_lane_width_arr = np.full(len(tracks), 3.5, np.float32)
+
     # heading (degrees in CSV → radians for computation)
     heading_deg = (tracks["heading"].astype(np.float32).to_numpy()
                    if "heading" in tracks.columns
@@ -700,7 +707,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                                 lc_state = 1.0
                         else:
                             lc_state = 0.0 if dy_cc * dvy_cc < 0 else 2.0
-                    else:  # v3 (default)
+                    elif cfg.lc_version == "v3":
                         nb_lat_v = float(yv[r])
                         nb_lco   = float(lat_lane_offset_arr[r])
                         if ki < 2:   # same lane (leadId, rearId)
@@ -721,6 +728,19 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                             if   nb_lat_v < -0.029: lc_state = 2.0
                             elif nb_lat_v >  0.029: lc_state = 0.0
                             else:                   lc_state = 1.0
+                    else:  # v4: lco_norm 기반 경계 판단 + slot별 방향 결정
+                        nb_lat_v  = float(yv[r])
+                        nb_lco    = float(lat_lane_offset_arr[r])
+                        nb_lw     = float(lat_lane_width_arr[r])
+                        nb_lco_norm = nb_lco / (nb_lw * 0.5) if nb_lw > 0.5 else 0.0
+                        if abs(nb_lco_norm) <= 0.5:
+                            lc_state = 1.0
+                        elif ki < 2:   # same lane
+                            lc_state = 0.0 if nb_lco_norm * nb_lat_v < 0 else 2.0
+                        elif ki < 5:   # left lane (slots 2,3,4)
+                            lc_state = 0.0 if nb_lat_v < 0 else 2.0
+                        else:          # right lane (slots 5,6,7)
+                            lc_state = 0.0 if nb_lat_v > 0 else 2.0
 
                     # ── LIT: key-point dx, relative dvx in ego frame ──────
                     # dx_key is already edge-to-edge for lead/rear slots
@@ -916,11 +936,12 @@ def parse_args() -> Config:
     # gate
     ap.add_argument("--gate_theta", type=float, default=0.0,
                     help="I threshold for single-mode gate. 0.0 = legacy time-window gate")
-    ap.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3"],
+    ap.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3", "v4"],
                     help="lc_state 계산 방식: "
                          "v1=slot기반 절대yV | "
                          "v2=dvy기반+slot/dy조합 | "
-                         "v3=latVelocity+latLaneCenterOffset기반 (default)")
+                         "v3=latVelocity+latLaneCenterOffset기반 (default) | "
+                         "v4=lco_norm(X=0.5) 기반 경계 판단+slot방향 결정")
 
     # exiD-specific
     ap.add_argument("--drop_vru", action="store_true", default=True,

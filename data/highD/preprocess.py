@@ -206,7 +206,7 @@ class Config:
     gate_theta: float = 0.0   # I threshold (single-mode); 0.0 = legacy time-window gate
 
     # lc_state version
-    lc_version: str = "v3"           # "v1" (slot-based) | "v2" (dy-sign-based) | "v3" (latV+lco-based)
+    lc_version: str = "v3"           # "v1" (slot-based) | "v2" (dy-sign-based) | "v3" (latV+lco-based) | "v4" (lco_norm-based)
 
     # neighbor feature mode
     non_relative: bool = False  # True → x_nb[0:6] = nb's abs values in globally-shifted frame
@@ -411,6 +411,11 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     # maybe_flip negates y for upper vehicles → negate lco to match
     lat_lane_offset_arr[dd == 1] *= -1.0
 
+    # lane width array (v4 lc_state용 lco_norm 계산)
+    lat_lane_width_arr = np.full(len(y), 3.75, np.float32)
+    lat_lane_width_arr[_ok_lo] = np.abs(lower_mark[_j_lo[_ok_lo] + 1] - lower_mark[_j_lo[_ok_lo]])
+    lat_lane_width_arr[_ok_up] = np.abs(upper_mark[_j_up[_ok_up] + 1] - upper_mark[_j_up[_ok_up]])
+
     if cfg.normalize_upper_xy:
         x, y, xv, yv, xa, ya, lane_id = maybe_flip(
             x, y, xv, yv, xa, ya, lane_id, dd, C_y, x_max, upper_mm
@@ -554,7 +559,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                         else:
                             # Case 3: same-lane slot (0/1) but |dy|>=dy_same → transitioning
                             lc_state = 0.0 if dy * dvy < 0 else 2.0
-                    else:  # v3 (default)
+                    elif cfg.lc_version == "v3":
                         nb_lat_v = float(yv[r])
                         nb_lco   = float(lat_lane_offset_arr[r])
                         if ki < 2:   # same lane (lead / rear)
@@ -575,6 +580,19 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                             if   nb_lat_v < -0.029: lc_state = 2.0
                             elif nb_lat_v >  0.029: lc_state = 0.0
                             else:                   lc_state = 1.0
+                    else:  # v4: lco_norm 기반 경계 판단 + slot별 방향 결정
+                        nb_lat_v  = float(yv[r])
+                        nb_lco    = float(lat_lane_offset_arr[r])
+                        nb_lw     = float(lat_lane_width_arr[r])
+                        nb_lco_norm = nb_lco / (nb_lw * 0.5) if nb_lw > 0.5 else 0.0
+                        if abs(nb_lco_norm) <= 0.5:
+                            lc_state = 1.0
+                        elif ki < 2:   # same lane
+                            lc_state = 0.0 if nb_lco_norm * nb_lat_v < 0 else 2.0
+                        elif ki < 5:   # left lane (slots 2,3,4)
+                            lc_state = 0.0 if nb_lat_v < 0 else 2.0
+                        else:          # right lane (slots 5,6,7)
+                            lc_state = 0.0 if nb_lat_v > 0 else 2.0
 
                     dx  = float(rel[0])
                     dvx = float(rel[2])
@@ -786,11 +804,12 @@ def parse_args() -> Config:
     # gate
     ap.add_argument("--gate_theta", type=float, default=0.0,
                     help="I threshold for single-mode (P85). 0.0 = legacy time-window gate")
-    ap.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3"],
+    ap.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3", "v4"],
                     help="lc_state 계산 방식: "
                          "v1=slot기반 절대yV (tf_trajPred 방식, 값범주 {-3,-2,-1,0,1,2,3}), "
                          "v2=dvy기반+slot/dy조합 (neighformer 방식, 값범주 {0,1,2}), "
-                         "v3=latVelocity+latLaneCenterOffset기반 (default, 값범주 {0,1,2})")
+                         "v3=latVelocity+latLaneCenterOffset기반 (default, 값범주 {0,1,2}), "
+                         "v4=lco_norm(X=0.5) 기반 경계 판단+slot방향 결정 (값범주 {0,1,2})")
 
     ap.add_argument("--non_relative", action="store_true", default=False,
                     help="x_nb[0:6] = neighbor's abs values in globally-shifted frame "
