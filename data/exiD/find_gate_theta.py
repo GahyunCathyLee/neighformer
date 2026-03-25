@@ -42,7 +42,9 @@ import matplotlib.pyplot as plt
 # ─────────────────────────────────────────────────────────────────────────────
 
 # x_nb 인덱스
-IDX_I   = 12   # composite importance I = sqrt((Ix^2 + Iy^2) / 2)
+IDX_IX  = 10   # I_x (raw, before gate)
+IDX_IY  = 11   # I_y (raw, before gate)
+# idx 12 = I * gate (gate 적용 후) — 여기서는 사용 안 함
 
 K       = 8    # neighbor slots
 
@@ -83,8 +85,10 @@ def compute_max_I_per_slot(x_nb: np.ndarray, nb_mask: np.ndarray) -> np.ndarray:
     N, T, K_dim = nb_mask.shape
     print(f"[Compute] max I per slot  (N={N}, T={T}, K={K_dim}) ...")
 
-    # I 값 추출: (N, T, K)
-    I_vals = x_nb[:, :, :, IDX_I].astype(np.float32)   # mmap → float32
+    # raw I 계산: sqrt((Ix^2 + Iy^2) / 2), gate 적용 전
+    ix = x_nb[:, :, :, IDX_IX].astype(np.float32)
+    iy = x_nb[:, :, :, IDX_IY].astype(np.float32)
+    I_vals = np.sqrt((ix ** 2 + iy ** 2) / 2.0)        # (N, T, K)
 
     # 존재하지 않는 timestep은 0으로 마스킹
     I_vals = I_vals * nb_mask.astype(np.float32)        # broadcast (N,T,K)
@@ -232,8 +236,8 @@ def main():
     max_I = compute_max_I_per_slot(x_nb, nb_mask)   # (N, K)
 
     # 전체 I 분포 요약
-    all_vals = max_I[max_I > 0]
-    print(f"\n[I distribution (non-zero max-per-slot)]")
+    all_vals = max_I.ravel()
+    print(f"\n[I distribution (all max-per-slot, including zero)]")
     for pct in [0.0, 0.1, 12.5, 25, 37.5, 50, 62.5, 75, 87.5, 90, 95, 99]:
         print(f"  P{pct:>2.1f}: {np.percentile(all_vals, pct):.4f}")
     print(f"  Max: {all_vals.max():.4f}")
