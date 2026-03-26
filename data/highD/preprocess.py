@@ -109,6 +109,11 @@ K       = 8    # neighbor slots
 # Slot priority for top-N gate tie-breaking: 0 > 2 > 5 > 1 > 4 > 7 > 3 > 6
 _TOPN_SLOT_PRIORITY = {s: r for r, s in enumerate([0, 2, 5, 1, 4, 7, 3, 6])}
 
+# Empirical slot weights (mean I per slot, from dataset analysis)
+# Order: preceding, following, leftPreceding, leftAlongside, leftFollowing,
+#        rightPreceding, rightAlongside, rightFollowing
+SLOT_WEIGHTS = [0.4944, 0.0411, 0.0935, 0.0074, 0.0002, 0.5559, 0.0000, 0.1179]
+
 
 def _apply_topn_gate(nb_row: np.ndarray, mask_row: np.ndarray, n: int) -> None:
     """Select top-n slots by I (idx 12) and zero-gate the rest (in-place).
@@ -222,6 +227,10 @@ class Config:
     # importance gate
     gate_theta: float = 0.0   # 0.0 = no threshold (all gates=1)
     gate_topn:  int   = 0     # >0 = keep top-N slots by I; 0 = disabled
+    gate_mask:  bool  = False  # True → gate=0 neighbors are removed from nb_mask
+
+    # slot importance: I_new = min(I * (1 + alpha * w_slot), 1.0);  0.0 = disabled
+    slot_importance_alpha: float = 0.0
 
     # lc_state version
     lc_version: str = "v3"           # "v1" (slot-based) | "v2" (dy-sign-based) | "v3" (latV+lco-based) | "v4" (lco_norm-based)
@@ -636,6 +645,13 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                             lis, delta_lane, lc_state
                         )
 
+                    # ── slot importance boost: I_new = I * (1 + alpha * w_slot) ──
+                    if cfg.slot_importance_alpha > 0.0:
+                        i_total = min(
+                            i_total * (1.0 + cfg.slot_importance_alpha * SLOT_WEIGHTS[ki]),
+                            1.0,
+                        )
+
                     # ── gate ──────────────────────────────────────────────
                     if cfg.gate_theta > 0.0:
                         gate = 1.0 if i_total >= cfg.gate_theta else 0.0
@@ -654,6 +670,13 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                 # ── top-N gate (applied after all slots are filled) ────
                 if cfg.gate_topn > 0:
                     _apply_topn_gate(x_nb[ti], nb_mask[ti], cfg.gate_topn)
+
+                # ── gate mask: remove gate=0 neighbors from nb_mask ────
+                if cfg.gate_mask:
+                    for ki in range(K):
+                        if nb_mask[ti, ki] and x_nb[ti, ki, 9] == 0.0:
+                            x_nb[ti, ki] = 0.0
+                            nb_mask[ti, ki] = False
 
             x_ego_list.append(x_ego)
             y_fut_list.append(y_fut)
@@ -702,6 +725,11 @@ def stage_raw2mmap(cfg: Config) -> None:
     print(f"  importance_mode : {cfg.importance_mode}"
           + (f"  lis_mode : {cfg.lis_mode}" if cfg.importance_mode == 'lis' else
              f"  params   : {IMPORTANCE_PARAMS_LIT}"))
+    if cfg.slot_importance_alpha > 0.0:
+        print(f"  slotImportance  : alpha={cfg.slot_importance_alpha}  "
+              f"I_new = min(I * (1 + {cfg.slot_importance_alpha} * w_slot), 1.0)")
+    if cfg.gate_mask:
+        print(f"  gate_mask       : enabled  (gate=0 neighbors removed from nb_mask)")
 
     # ── pass 1: process all recordings in parallel ────────────────────────────
     bufs: List[Dict[str, np.ndarray]] = []
@@ -828,6 +856,13 @@ def parse_args() -> Config:
     ap.add_argument("--gate_topn", type=int, default=0,
                     help="Top-N gate: keep up to N slots with highest I; "
                          "tie-break by slot priority 0>2>5>1>4>7>3>6. 0 = disabled")
+    ap.add_argument("--gate_mask", action="store_true", default=False,
+                    help="If set, gate=0 neighbors are removed from nb_mask entirely "
+                         "(zeroed features + nb_mask=False). Requires gate_theta or gate_topn.")
+    ap.add_argument("--slotImportance", type=float, default=0.0,
+                    dest="slot_importance_alpha",
+                    help="Slot importance boost alpha: I_new = min(I * (1 + alpha * w_slot), 1.0). "
+                         "w_slot = empirical mean I per slot. 0.0 = disabled (default)")
     ap.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3", "v4"],
                     help="lc_state 계산 방식: "
                          "v1=slot기반 절대yV (tf_trajPred 방식, 값범주 {-3,-2,-1,0,1,2,3}), "
@@ -863,6 +898,8 @@ def parse_args() -> Config:
         importance_mode = a.importance_mode,
         gate_theta      = a.gate_theta,
         gate_topn       = a.gate_topn,
+        gate_mask       = a.gate_mask,
+        slot_importance_alpha = a.slot_importance_alpha,
         lc_version    = a.lc_version,
         non_relative = a.non_relative,
         dry_run     = a.dry_run,
