@@ -1,12 +1,12 @@
-exp_tag : c2-2   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
+exp_tag : test23-2   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 
 # =========================
 # DATA
 # =========================
 data:
-  mmap_dir   : data/highD/v4_lit_g2_slot3
+  mmap_dir   : data/highD/v4_7_g2_slot3
   splits_dir : data/highD/splits_v4_lit_g2_slot3
-  stats_dir  : data/highD/stats_v4_lit_g2_slot3
+  stats_dir  : data/highD/stats_v4_7_g2_slot3
 
   hz          : 3.0
   batch_size  : 1024
@@ -63,7 +63,7 @@ train:
   device : cuda
   seed   : 1234
 
-  epochs        : 200
+  epochs        : 100
   lr            : 3e-4
   weight_decay  : 0.0
   use_amp       : false

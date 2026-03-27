@@ -1,4 +1,4 @@
-exp_tag : c2-3   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
+exp_tag : test22-2   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 
 # =========================
 # DATA
@@ -29,8 +29,8 @@ features:
   use_lit      : false
   use_lis      : false
   use_gate     : false
-  use_I_x      : false
-  use_I_y      : true
+  use_I_x      : true
+  use_I_y      : false
   use_I        : false
 
 
@@ -61,9 +61,9 @@ model:
 # =========================
 train:
   device : cuda
-  seed   : 3407
+  seed   : 1234
 
-  epochs        : 200
+  epochs        : 100
   lr            : 3e-4
   weight_decay  : 0.0
   use_amp       : false
