@@ -697,18 +697,15 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     else:
                         gate = 1.0  # gate_topn post-processing or all-active default
 
+                    i_total *= gate
+
                     x_nb[ti, ki, 6]  = lc_state
                     x_nb[ti, ki, 7]  = lit
-<<<<<<< HEAD
                     x_nb[ti, ki, 8]  = size_bin
-                    i_total *= gate
-=======
-                    x_nb[ti, ki, 8]  = lis
->>>>>>> 40ae8b4953ab61b20ccd2229177724958de797d6
                     x_nb[ti, ki, 9]  = gate
                     x_nb[ti, ki, 10] = ix * gate
                     x_nb[ti, ki, 11] = iy * gate
-                    x_nb[ti, ki, 12] = i_total * gate
+                    x_nb[ti, ki, 12] = i_total
 
                 # ── top-N gate (applied after all slots are filled) ────
                 if cfg.gate_topn > 0:
