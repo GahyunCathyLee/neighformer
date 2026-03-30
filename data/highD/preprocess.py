@@ -129,6 +129,8 @@ def _apply_topn_gate(nb_row: np.ndarray, mask_row: np.ndarray, n: int) -> None:
     for k in valid:
         if k not in selected:
             nb_row[k, 9]  = 0.0
+            nb_row[k, 10] = 0.0
+            nb_row[k, 11] = 0.0
             nb_row[k, 12] = 0.0
 
 
@@ -697,12 +699,16 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
 
                     x_nb[ti, ki, 6]  = lc_state
                     x_nb[ti, ki, 7]  = lit
+<<<<<<< HEAD
                     x_nb[ti, ki, 8]  = size_bin
                     i_total *= gate
+=======
+                    x_nb[ti, ki, 8]  = lis
+>>>>>>> 40ae8b4953ab61b20ccd2229177724958de797d6
                     x_nb[ti, ki, 9]  = gate
-                    x_nb[ti, ki, 10] = ix
-                    x_nb[ti, ki, 11] = iy
-                    x_nb[ti, ki, 12] = i_total
+                    x_nb[ti, ki, 10] = ix * gate
+                    x_nb[ti, ki, 11] = iy * gate
+                    x_nb[ti, ki, 12] = i_total * gate
 
                 # ── top-N gate (applied after all slots are filled) ────
                 if cfg.gate_topn > 0:
