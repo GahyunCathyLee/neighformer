@@ -20,7 +20,7 @@ x_nb   : (N, T, K, 13)   ego-relative neighbor features
     idx  4  dax       relative longitudinal acceleration
     idx  5  day       relative lateral acceleration
     idx  6  lc_state  lane-change state  {0: closing in, 1: stay, 2: moving out}
-    idx  7  lit       Longitudinal Interaction Time  dx / (dvx ± eps)
+    idx  7  volume    vehicle volume  width * length * height_est  (m³)
     idx  8  size_bin  vehicle size bin (0~4) based on width*length*height_est
                       0: 소형차 (5~12 m³), 1: 일반 승용차 (12~20 m³)
                       2: 대형 승용/픽업 (20~90 m³), 3: 중형 트럭 (90~150 m³)
@@ -165,8 +165,8 @@ LIS_BINS: Dict[str, Dict] = {
 _VOLUME_BIN_EDGES = [12.0, 20.0, 90.0, 150.0]  # 4 inner cuts → 5 bins
 
 
-def _volume_bin(phys_length: float, phys_width: float, vehicle_class: str) -> float:
-    """Return size bin index (0~4) for a neighbor vehicle.
+def _volume_bin(phys_length: float, phys_width: float, vehicle_class: str) -> Tuple[float, float]:
+    """Return (size bin index 0~4, raw volume m³) for a neighbor vehicle.
 
     height is estimated from vehicle class and physical length:
       Car:   length < 4.5m → 1.45m,  < 5.0m → 1.70m,  >= 5.0m → 1.90m
@@ -181,8 +181,8 @@ def _volume_bin(phys_length: float, phys_width: float, vehicle_class: str) -> fl
     volume = phys_width * phys_length * height
     for i, edge in enumerate(_VOLUME_BIN_EDGES):
         if volume < edge:
-            return float(i)
-    return 4.0
+            return float(i), volume
+    return 4.0, volume
 
 
 def _lit_to_lis(lit: float, lis_mode: str) -> float:
@@ -670,7 +670,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     nb_class   = vid_to_class.get(nid, "Car")
                     nb_phys_l  = vid_to_w.get(nid, 0.0)   # CSV width = physical length
                     nb_phys_w  = vid_to_l.get(nid, 0.0)   # CSV height = physical width
-                    size_bin   = _volume_bin(nb_phys_l, nb_phys_w, nb_class)
+                    size_bin, nb_volume = _volume_bin(nb_phys_l, nb_phys_w, nb_class)
                     lis        = _lit_to_lis(lit, cfg.lis_mode)
                     delta_lane = float(abs(int(lane_id[r]) - int(ego_lane_arr[ti])))
 
@@ -700,7 +700,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     i_total *= gate
 
                     x_nb[ti, ki, 6]  = lc_state
-                    x_nb[ti, ki, 7]  = lit
+                    x_nb[ti, ki, 7]  = nb_volume
                     x_nb[ti, ki, 8]  = size_bin
                     x_nb[ti, ki, 9]  = gate
                     x_nb[ti, ki, 10] = ix * gate
