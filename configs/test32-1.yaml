@@ -1,19 +1,19 @@
-exp_tag : test22-2   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
+exp_tag : test32-1   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 
 # =========================
 # DATA
 # =========================
 data:
-  mmap_dir   : data/highD/v4_lit_g2_slot3
-  splits_dir : data/highD/splits_v4_lit_g2_slot3
-  stats_dir  : data/highD/stats_v4_lit_g2_slot3
+  mmap_dir   : data/highD/c5
+  splits_dir : data/highD/splits_c5
+  stats_dir  : data/highD/stats_c5
 
   hz          : 3.0
   batch_size  : 1024
   num_workers : 24
 
   # scenario labels (optional — 없으면 stratified eval/sampling 비활성화)
-  scenario_labels: data/highD/v4_lit_g2_slot3/scenario_labels.csv
+  scenario_labels: data/highD/c5/scenario_labels.csv
 
 
 # =========================
@@ -26,11 +26,11 @@ features:
   nb_kin_mode  : pva      # p | v | a | pv | pa | va | pva | none
   use_lc_state : false
   use_dx_time  : false
-  use_lit      : false
+  use_lit      : true
   use_lis      : false
   use_gate     : false
-  use_I_x      : true
-  use_I_y      : false
+  use_I_x      : false
+  use_I_y      : true
   use_I        : false
 
 
@@ -46,10 +46,10 @@ model:
 
   use_neighbors : true
 
-  d_model    : 128
-  nhead      : 4
-  enc_layers : 3
-  dec_layers : 3
+  d_model    : 256
+  nhead      : 8
+  enc_layers : 4
+  dec_layers : 4
   dropout    : 0.0
 
   M             : 6
@@ -61,7 +61,7 @@ model:
 # =========================
 train:
   device : cuda
-  seed   : 1234
+  seed   : 42
 
   epochs        : 100
   lr            : 3e-4
@@ -81,6 +81,6 @@ train:
 
   # logging / ckpt
   monitor   : val_ade     # val_loss | val_ade | val_fde | val_rmse
-  ckpt_dir  : /content/drive/MyDrive/TrajectoryPrediction/neighformer/ckpts
+  ckpt_dir  : ckpts
 
   stratified_eval: false

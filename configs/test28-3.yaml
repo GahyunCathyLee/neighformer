@@ -1,19 +1,19 @@
-exp_tag : test26-2   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
+exp_tag : test28-3   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 
 # =========================
 # DATA
 # =========================
 data:
-  mmap_dir   : data/highD/v4_7_g2_slot3
-  splits_dir : data/highD/splits_v4_lit_g2_slot3
-  stats_dir  : data/highD/stats_v4_7_g2_slot3
+  mmap_dir   : data/highD/c2
+  splits_dir : data/highD/splits_v4_7
+  stats_dir  : data/highD/stats_c2
 
   hz          : 3.0
   batch_size  : 1024
-  num_workers : 24
+  num_workers : 64
 
   # scenario labels (optional — 없으면 stratified eval/sampling 비활성화)
-  scenario_labels: data/highD/v4_lit_g2_slot3/scenario_labels.csv
+  scenario_labels: data/highD/v4_7/scenario_labels.csv
 
 
 # =========================
@@ -27,9 +27,9 @@ features:
   use_lc_state : false
   use_dx_time  : false
   use_lit      : false
-  use_lis      : false
+  use_lis      : true
   use_gate     : false
-  use_I_x      : true
+  use_I_x      : false
   use_I_y      : false
   use_I        : false
 
@@ -61,7 +61,7 @@ model:
 # =========================
 train:
   device : cuda
-  seed   : 1234
+  seed   : 3407
 
   epochs        : 100
   lr            : 3e-4
@@ -81,6 +81,6 @@ train:
 
   # logging / ckpt
   monitor   : val_ade     # val_loss | val_ade | val_fde | val_rmse
-  ckpt_dir  : /content/drive/MyDrive/TrajectoryPrediction/neighformer/ckpts
+  ckpt_dir  : ckpts
 
   stratified_eval: false
