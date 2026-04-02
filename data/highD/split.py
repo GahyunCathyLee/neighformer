@@ -13,6 +13,7 @@ Stratification modes  (--stratify)
   event        Track-level stratified split by event label only.
   state        Track-level stratified split by state label only.
   combined     Track-level stratified split by "event × state" (6 combos).
+  track        Track-level random split (no label stratification).
   none         Simple random split on window indices (no track grouping).
 
 Split strategy
@@ -21,6 +22,11 @@ Split strategy
     Windows are grouped by track. A representative label is assigned to each
     track, then tracks are stratified-split. This prevents windows from the
     same track leaking across splits.
+
+  Track-based random (track):
+    Windows are grouped by track, then tracks are randomly split without any
+    label stratification. Same-track windows stay in the same split, but
+    scenario labels are not used.
 
   Random (none):
     Window indices are shuffled and split directly.
@@ -37,7 +43,10 @@ Usage examples
   # State-only stratification
   python split.py --stratify state
 
-  # No scenario split (random)
+  # Track-level random split (scenario label 미사용)
+  python split.py --stratify track
+
+  # No scenario split (random, track 경계도 무시)
   python split.py --stratify none
 
   # Train만 stratify, val/test는 random (train-only 모드)
@@ -60,6 +69,7 @@ from sklearn.model_selection import train_test_split
 # Defaults  (scenario_label.py / preprocess.py 경로 기준)
 # ──────────────────────────────────────────────────────────────────────────────
 DEFAULT_LABEL_FILE = "data/highD/mmap/scenario_labels.csv"
+DEFAULT_META_DIR   = "data/highD/mmap"
 DEFAULT_OUTPUT_DIR = "data/highD/splits"
 
 DEFAULT_TRAIN = 0.7
@@ -187,6 +197,43 @@ def scenario_split(
     return _flatten(train_tracks), _flatten(val_tracks), _flatten(test_tracks)
 
 
+def track_random_split(
+    df: pd.DataFrame,
+    train_ratio: float,
+    val_ratio: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Track 단위로 묶되, label stratification 없이 무작위 분할합니다.
+    같은 track의 window가 split 경계를 넘지 않도록 보장하지만,
+    scenario label은 사용하지 않습니다.
+    """
+    print("\n[Track-based random split  |  stratify=track]")
+
+    records = []
+    for (rid, tid), grp in df.groupby(["recordingId", "trackId"], sort=False):
+        records.append({"indices": grp["global_index"].tolist()})
+    track_df = pd.DataFrame(records)
+
+    print(f"  Unique tracks : {len(track_df):,}")
+
+    rng = np.random.default_rng(seed)
+    shuffled = track_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    n = len(shuffled)
+    n_train = int(n * train_ratio)
+    n_val   = int(n * val_ratio)
+
+    train_tracks = shuffled.iloc[:n_train]
+    val_tracks   = shuffled.iloc[n_train : n_train + n_val]
+    test_tracks  = shuffled.iloc[n_train + n_val :]
+
+    def _flatten(subset: pd.DataFrame) -> np.ndarray:
+        return np.array(sorted(idx for idxs in subset["indices"] for idx in idxs))
+
+    return _flatten(train_tracks), _flatten(val_tracks), _flatten(test_tracks)
+
+
 def random_split(
     df: pd.DataFrame,
     train_ratio: float,
@@ -240,7 +287,13 @@ def parse_args() -> argparse.Namespace:
     # ── paths ─────────────────────────────────────────────────────────────────
     ap.add_argument(
         "--label_file", default=DEFAULT_LABEL_FILE,
-        help="Path to scenario_labels.csv produced by scenario_label.py",
+        help="Path to scenario_labels.csv produced by scenario_label.py "
+             "(not required when --stratify track or none)",
+    )
+    ap.add_argument(
+        "--meta_dir", default=DEFAULT_META_DIR,
+        help="Directory containing meta_recordingId.npy and meta_trackId.npy "
+             "(used when --stratify track or none)",
     )
     ap.add_argument(
         "--output_dir", default=DEFAULT_OUTPUT_DIR,
@@ -259,12 +312,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--stratify",
         default="combined",
-        choices=["event", "state", "combined", "none"],
+        choices=["event", "state", "combined", "track", "none"],
         help=(
             "Stratification key for the track-level split.\n"
             "  event    : by event label (cut_in / lane_change / lane_following)\n"
             "  state    : by traffic state (dense / free_flow)\n"
             "  combined : by event × state (up to 6 combinations)  [default]\n"
+            "  track    : track-level random split (scenario label 미사용)\n"
             "  none     : random split on window indices (no track grouping)"
         ),
     )
@@ -311,18 +365,36 @@ def main() -> None:
     )
     print(f"[INFO] Stratify : {args.stratify}  (eval={'random' if args.no_stratify_eval else 'stratified'})")
 
-    # ── load label file ───────────────────────────────────────────────────────
-    label_path = Path(args.label_file)
-    if not label_path.exists():
-        raise FileNotFoundError(f"Label file not found: {label_path}")
-
-    df = pd.read_csv(label_path)
-    df["global_index"] = df.index
-    print(f"[INFO] Loaded {len(df):,} windows from: {label_path}")
+    # ── load data ─────────────────────────────────────────────────────────────
+    if args.stratify in ("track", "none"):
+        # scenario label 불필요 — meta npy에서 track 정보만 로드
+        meta_dir = Path(args.meta_dir)
+        rec_path = meta_dir / "meta_recordingId.npy"
+        trk_path = meta_dir / "meta_trackId.npy"
+        for p in (rec_path, trk_path):
+            if not p.exists():
+                raise FileNotFoundError(f"Meta file not found: {p}")
+        df = pd.DataFrame({
+            "recordingId":  np.load(rec_path),
+            "trackId":      np.load(trk_path),
+        })
+        df["global_index"] = df.index
+        print(f"[INFO] Loaded {len(df):,} windows from: {meta_dir}")
+    else:
+        label_path = Path(args.label_file)
+        if not label_path.exists():
+            raise FileNotFoundError(f"Label file not found: {label_path}")
+        df = pd.read_csv(label_path)
+        df["global_index"] = df.index
+        print(f"[INFO] Loaded {len(df):,} windows from: {label_path}")
 
     # ── split ─────────────────────────────────────────────────────────────────
     if args.stratify == "none":
         train_idx, val_idx, test_idx = random_split(
+            df, train_ratio, val_ratio, args.seed
+        )
+    elif args.stratify == "track":
+        train_idx, val_idx, test_idx = track_random_split(
             df, train_ratio, val_ratio, args.seed
         )
     else:
