@@ -1,4 +1,4 @@
-exp_tag : test31-1   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
+exp_tag : test32-4   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 
 # =========================
 # DATA
@@ -46,10 +46,10 @@ model:
 
   use_neighbors : true
 
-  d_model    : 128
-  nhead      : 4
-  enc_layers : 3
-  dec_layers : 3
+  d_model    : 256
+  nhead      : 8
+  enc_layers : 4
+  dec_layers : 4
   dropout    : 0.0
 
   M             : 6
@@ -61,7 +61,7 @@ model:
 # =========================
 train:
   device : cuda
-  seed   : 42
+  seed   : 0
 
   epochs        : 100
   lr            : 3e-4

@@ -1,4 +1,4 @@
-exp_tag : test31-1   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
+exp_tag : test31-5   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 
 # =========================
 # DATA
@@ -61,7 +61,7 @@ model:
 # =========================
 train:
   device : cuda
-  seed   : 42
+  seed   : 777
 
   epochs        : 100
   lr            : 3e-4
