@@ -81,6 +81,6 @@ train:
 
   # logging / ckpt
   monitor   : val_ade     # val_loss | val_ade | val_fde | val_rmse
-  ckpt_dir  : ckpts
+  ckpt_dir  : /content/drive/MyDrive/TrajectoryPrediction/neighformer/ckpts
 
   stratified_eval: false
