@@ -13,6 +13,8 @@ def main():
     ckpt_path = sys.argv[1]
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
+    print(f"[INFO] keys in checkpoint: {list(ckpt.keys())}")
+
     cfg = ckpt.get("cfg")
     if cfg is None:
         print("[ERROR] 'cfg' key not found in checkpoint.")
