@@ -997,7 +997,7 @@ def parse_args() -> Config:
 
     # recording
     ap.add_argument("--target_hz",          type=float, default=3.0)
-    ap.add_argument("--history_sec",        type=float, default=3.0)
+    ap.add_argument("--history_sec",        type=float, default=2.0)
     ap.add_argument("--future_sec",         type=float, default=5.0)
     ap.add_argument("--stride_sec",         type=float, default=1.0)
     ap.add_argument("--normalize_upper_xy", action="store_true", default=True)
