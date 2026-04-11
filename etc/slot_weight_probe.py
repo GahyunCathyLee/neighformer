@@ -294,7 +294,7 @@ def visualize(weights: np.ndarray, occupancy: np.ndarray, tag: str, out_path: st
     means, stds, occs, uniform, mean_occupied = _compute_stats(weights, occupancy)
 
     x = np.arange(K)
-    fig, axes = plt.subplots(2, 1, figsize=(11, 8))
+    fig, axes = plt.subplots(2, 1, figsize=(22, 16))
 
     # ── Weight bar ──
     ax = axes[0]
@@ -303,8 +303,6 @@ def visualize(weights: np.ndarray, occupancy: np.ndarray, tag: str, out_path: st
     ax.set_xticklabels(SLOT_NAMES, rotation=30, ha="right", fontsize=10)
     ax.set_ylabel("Learned weight (softmax)")
     ax.set_title(f"Per-slot learned weights — {tag}", fontsize=13)
-    ax.axhline(uniform, color="gray", linestyle="--", linewidth=1,
-               label=f"uniform (1/{mean_occupied:.1f} occupied = {uniform:.3f})")
     ax.legend()
 
     # ── Occupancy bar ──
@@ -317,7 +315,7 @@ def visualize(weights: np.ndarray, occupancy: np.ndarray, tag: str, out_path: st
     ax2.set_title("Slot occupancy rate (val set)", fontsize=13)
 
     plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
+    plt.savefig(out_path, dpi=300)
     print(f"Saved → {out_path}")
 
     # ── Console table ──
@@ -364,8 +362,6 @@ def visualize_by_lane_level(
         ax.set_xticklabels(SLOT_NAMES, rotation=35, ha="right", fontsize=9)
         ax.set_ylabel("Learned weight (softmax)" if col == 0 else "")
         ax.set_title(f"{level_name}\n(N={n_samples:,})", fontsize=11)
-        ax.axhline(uniform, color="gray", linestyle="--", linewidth=1,
-                   label=f"uniform={uniform:.3f}")
         ax.legend(fontsize=8)
 
         # ── occupancy panel ──
@@ -389,7 +385,7 @@ def visualize_by_lane_level(
 
     fig.suptitle(f"Per-slot learned weights by lane level — {tag}", fontsize=13, y=1.01)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
     print(f"\nSaved → {out_path}")
 
 
@@ -439,10 +435,6 @@ def visualize_lc_surroundings(
             ax2.bar(x + off, occs, width=0.38,
                     color=phase_colors[ph], alpha=0.6)
 
-        if ref_uniform is not None:
-            ax.axhline(ref_uniform, color="gray", linestyle="--", linewidth=1,
-                       label=f"uniform={ref_uniform:.3f}")
-
         ax.set_xticks(x)
         ax.set_xticklabels(SLOT_NAMES, rotation=35, ha="right", fontsize=8)
         ax.set_title(f"[{lc_tp}] {LC_TYPE_NAMES[lc_tp]}", fontsize=10)
@@ -468,7 +460,7 @@ def visualize_lc_surroundings(
 
     fig.suptitle(f"Slot weights: pre / post LC (±5s) — {tag}", fontsize=12, y=1.01)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
     print(f"\nSaved → {out_path}")
 
 
