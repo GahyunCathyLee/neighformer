@@ -1,19 +1,19 @@
-exp_tag : test30-5   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
+exp_tag : test36-2   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 
 # =========================
 # DATA
 # =========================
 data:
-  mmap_dir   : data/highD/c2
-  splits_dir : data/highD/splits_v4_7
-  stats_dir  : data/highD/stats_c2
+  mmap_dir   : data/highD/test36
+  splits_dir : data/highD/splits_c6
+  stats_dir  : data/highD/stats_test36
 
   hz          : 3.0
   batch_size  : 1024
   num_workers : 64
 
   # scenario labels (optional — 없으면 stratified eval/sampling 비활성화)
-  scenario_labels: data/highD/v4_7/scenario_labels.csv
+  scenario_labels: data/highD/c6/scenario_labels.csv
 
 
 # =========================
@@ -26,8 +26,8 @@ features:
   nb_kin_mode  : pva      # p | v | a | pv | pa | va | pva | none
   use_lc_state : false
   use_dx_time  : false
-  use_lit      : true
-  use_lis      : false
+  use_lit      : false
+  use_lis      : true
   use_gate     : false
   use_I_x      : false
   use_I_y      : true
@@ -61,7 +61,7 @@ model:
 # =========================
 train:
   device : cuda
-  seed   : 777
+  seed   : 1234
 
   epochs        : 100
   lr            : 3e-4
