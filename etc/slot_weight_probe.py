@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,6 +42,15 @@ EGO_DIM = 6
 NB_DIM  = 13
 NB_KIN  = 4   # dx, dy, dvx, dvy (idx 0-3)
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+
 SLOT_NAMES = [
     "preceding",      # 0  앞-동일차선
     "following",      # 1  뒤-동일차선
@@ -53,20 +63,6 @@ SLOT_NAMES = [
 ]
 
 LANE_LEVEL_NAMES = {0: "leftmost (fast)", 1: "middle", 2: "rightmost (slow)"}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Reproducibility
-# ─────────────────────────────────────────────────────────────────────────────
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark     = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,7 +150,7 @@ def filter_by_lc_types(
     all_lct = _require_meta(mmap_dir / "meta_lc_type.npy")
     all_lcp = _require_meta(mmap_dir / "meta_lc_phase.npy")
 
-    type_mask = np.isin(indices, np.where(np.isin(all_lct, lc_types))[0])
+    type_mask  = np.isin(indices, np.where(np.isin(all_lct, lc_types))[0])
     phase_mask = np.ones(len(indices), bool)
     if lc_phase != -99:
         phase_mask = np.isin(indices, np.where(all_lcp == lc_phase)[0])
@@ -218,202 +214,66 @@ def compute_stats(
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TemporalEncoder(nn.Module):
-    """
-    Transformer 기반 시계열 인코더 (슬롯·ego 공용).
-
-    - 입력의 존재 여부를 padding_mask로 처리.
-    - 완전히 absent한 시퀀스는 출력이 0 벡터.
-    - 존재하는 타임스텝만 masked mean pool로 집약.
-
-    Input:
-      x            (N, T, input_dim)
-      padding_mask (N, T) bool   — True = absent (padding)
-    Output:
-      (N, d_enc)
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        d_enc: int,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.input_proj = nn.Linear(input_dim, d_enc)
-        self.pos_emb    = nn.Embedding(T, d_enc)
-        encoder_layer   = nn.TransformerEncoderLayer(
-            d_model=d_enc, nhead=n_heads,
-            dim_feedforward=d_enc * 2,
-            dropout=dropout, batch_first=True, norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-        _, T_len, _ = x.shape
-        pos = torch.arange(T_len, device=x.device)
-        h   = self.input_proj(x) + self.pos_emb(pos)              # (N, T, d_enc)
-
-        # all-masked row → NaN 방지: 첫 타임스텝만 임시로 un-mask
-        fully_absent         = padding_mask.all(dim=1)             # (N,)
-        safe_mask            = padding_mask.clone()
-        safe_mask[fully_absent, 0] = False
-
-        h = self.transformer(h, src_key_padding_mask=safe_mask)    # (N, T, d_enc)
-
-        # masked mean pool (존재하는 타임스텝만)
-        present   = ~safe_mask                                     # (N, T)
-        n_present = present.float().sum(dim=1, keepdim=True).clamp(min=1.0)
-        h_mean    = (h * present.unsqueeze(-1)).sum(dim=1) / n_present  # (N, d_enc)
-
-        # fully absent 슬롯은 0 벡터
-        h_mean = h_mean * (~fully_absent).float().unsqueeze(-1)    # (N, d_enc)
-        return h_mean
-
-
 class SlotWeightNet(nn.Module):
     """
-    Temporal encoding → per-slot weight logits.
+    Per-slot weight 생성기.
 
     Input:
-      slot_enc (B, K, d_enc)  — per-slot temporal encodings
-      ego_enc  (B, d_enc)     — ego temporal encoding
+      nb_avg  (B, K, NB_DIM)  — time-averaged neighbor features (masked)
+      ego_avg (B, EGO_DIM)    — time-averaged ego features
     Output:
-      logits   (B, K)
+      logits  (B, K)           — raw scores (softmax는 SlotWeightProbe에서 처리)
     """
 
-    def __init__(self, K: int, d_enc: int, d_hidden: int = 64):
+    def __init__(self, K: int = 8, nb_dim: int = NB_DIM, ego_dim: int = EGO_DIM, d: int = 32):
         super().__init__()
         self.K        = K
-        self.slot_pos = nn.Embedding(K, d_enc)    # slot 위치/역할 인코딩
-        self.mlp      = nn.Sequential(
-            nn.Linear(d_enc * 3, d_hidden),       # slot_enc ⊕ ego_enc ⊕ slot_pos
+        self.slot_emb = nn.Embedding(K, d)        # slot 위치/역할 인코딩
+        self.nb_proj  = nn.Linear(nb_dim, d)
+        self.ego_proj = nn.Linear(ego_dim, d)
+        self.mlp = nn.Sequential(
+            nn.Linear(3 * d, d),
             nn.ReLU(),
-            nn.Linear(d_hidden, d_hidden),
-            nn.ReLU(),
-            nn.Linear(d_hidden, 1),
+            nn.Linear(d, 1),              # raw logit, no activation
         )
 
-    def forward(self, slot_enc: torch.Tensor, ego_enc: torch.Tensor) -> torch.Tensor:
-        B        = slot_enc.shape[0]
-        slot_idx = torch.arange(self.K, device=slot_enc.device)
-        slot_pos = self.slot_pos(slot_idx).unsqueeze(0).expand(B, -1, -1)  # (B, K, d_enc)
-        ego_exp  = ego_enc.unsqueeze(1).expand(-1, self.K, -1)             # (B, K, d_enc)
-        feat     = torch.cat([slot_enc, ego_exp, slot_pos], dim=-1)        # (B, K, 3*d_enc)
-        return self.mlp(feat).squeeze(-1)                                   # (B, K)
+    def forward(self, nb_avg: torch.Tensor, ego_avg: torch.Tensor) -> torch.Tensor:
+        B = nb_avg.shape[0]
+        slot_idx  = torch.arange(self.K, device=nb_avg.device)
+        slot_feat = self.slot_emb(slot_idx).unsqueeze(0).expand(B, -1, -1)         # (B, K, d)
+        nb_feat   = self.nb_proj(nb_avg)                                             # (B, K, d)
+        ego_feat  = self.ego_proj(ego_avg).unsqueeze(1).expand(-1, self.K, -1)     # (B, K, d)
+        feat      = torch.cat([slot_feat, nb_feat, ego_feat], dim=-1)               # (B, K, 3d)
+        return self.mlp(feat).squeeze(-1)                                            # (B, K)
 
 
 class SlotWeightProbe(nn.Module):
     """
-    Temporal encoding + per-slot trajectory prediction probe.
+    SlotWeightNet + 작은 MLP predictor.
 
-    설계 원칙
-    ─────────
-    1. time averaging 없음: 각 슬롯·ego의 T-step 시계열을 Transformer로 인코딩.
-       → 급감속, 차선 변경 시점 등 temporal dynamics를 온전히 반영.
-
-    2. prediction-space weighted sum:
-         slot_preds (B, K, Tf, 2) — 각 슬롯이 독립적으로 ego trajectory 예측
-         pred = Σ_k  w_k * slot_pred_k
-       → w_k gradient = ∂loss/∂pred × slot_pred_k
-         "k번째 슬롯의 예측이 실제 trajectory와 얼마나 일치하는가"를 직접 반영.
-
-    2-stage 학습
-    ────────────
-    Stage 1 (slot_encoder + ego_encoder + slot_emb + slot_predictor):
-      uniform weights 아래서 각 슬롯이 독립적으로 ego trajectory를 학습.
-      slot_predictor가 weight distribution 변화를 보정하는 능력을 차단.
-
-    Stage 2 (weight_net만):
-      고정된 slot_predictor를 기준으로 weight_net이
-      "어느 슬롯의 예측을 믿을지"를 학습. gradient가 명확해짐.
+    Predictor: weighted sum of nb kinematics + ego → future positions
     """
 
     def __init__(
         self,
-        K: int       = 8,
-        nb_dim: int  = NB_DIM,
+        K: int = 8,
+        nb_kin_dim: int = NB_KIN,
+        nb_dim: int = NB_DIM,
         ego_dim: int = EGO_DIM,
-        d_enc: int   = 64,
-        d_hidden: int = 64,
-        n_heads: int  = 4,
-        n_layers: int = 2,
-        dropout: float = 0.1,
+        d: int = 32,
         Tf: int = 15,
     ):
         super().__init__()
-        self.K  = K
-        self.Tf = Tf
-
-        # ── temporal encoders ──
-        self.slot_encoder = TemporalEncoder(nb_dim,  d_enc, n_heads, n_layers, dropout)
-        self.ego_encoder  = TemporalEncoder(ego_dim, d_enc, n_heads, n_layers, dropout)
-
-        # ── slot weight generator ──
-        self.weight_net = SlotWeightNet(K, d_enc, d_hidden)
-
-        # ── per-slot predictor (Stage 1 학습 대상) ──
-        # 입력: slot_enc (d_enc) ⊕ ego_enc (d_enc) ⊕ slot_emb (d_enc)
-        self.slot_emb       = nn.Embedding(K, d_enc)
-        self.slot_predictor = nn.Sequential(
-            nn.Linear(d_enc * 3, 128),
+        self.weight_net = SlotWeightNet(K=K, nb_dim=nb_dim, ego_dim=ego_dim, d=d)
+        self.predictor  = nn.Sequential(
+            nn.Linear(nb_kin_dim + ego_dim, 64),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(128, Tf * 2),
+            nn.Linear(64, Tf * 2),
         )
-
-    # ── shared helpers ────────────────────────────────────────────────────────
-
-    def _encode(
-        self,
-        x_nb: torch.Tensor,
-        x_ego: torch.Tensor,
-        nb_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        시계열 전체를 Transformer로 인코딩.
-
-        Returns
-        -------
-        slot_enc (B, K, d_enc)
-        ego_enc  (B, d_enc)
-        nb_exist (B, K) bool  — 슬롯이 history 중 한 번이라도 존재했는지
-        """
-        B, T_len, K, _ = x_nb.shape
-
-        # slot: (B, T, K, NB_DIM) → (B*K, T, NB_DIM)
-        x_slot     = x_nb.permute(0, 2, 1, 3).reshape(B * K, T_len, -1)
-        slot_pmask = ~nb_mask.permute(0, 2, 1).reshape(B * K, T_len)   # True=absent
-        slot_enc   = self.slot_encoder(x_slot, slot_pmask).view(B, K, -1)  # (B, K, d_enc)
-
-        # ego: always fully present
-        ego_pmask = torch.zeros(B, T_len, dtype=torch.bool, device=x_ego.device)
-        ego_enc   = self.ego_encoder(x_ego, ego_pmask)                      # (B, d_enc)
-
-        nb_exist = nb_mask.any(dim=1)                                        # (B, K)
-        return slot_enc, ego_enc, nb_exist
-
-    def _slot_preds(
-        self,
-        slot_enc: torch.Tensor,
-        ego_enc: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        slot_enc : (B, K, d_enc)
-        ego_enc  : (B, d_enc)
-        Returns  : (B, K, Tf, 2)
-        """
-        B        = slot_enc.shape[0]
-        slot_idx = torch.arange(self.K, device=slot_enc.device)
-        slot_pos = self.slot_emb(slot_idx).unsqueeze(0).expand(B, -1, -1)  # (B, K, d_enc)
-        ego_exp  = ego_enc.unsqueeze(1).expand(-1, self.K, -1)             # (B, K, d_enc)
-        feat     = torch.cat([slot_enc, ego_exp, slot_pos], dim=-1)        # (B, K, 3*d_enc)
-        return self.slot_predictor(feat).view(B, self.K, self.Tf, 2)       # (B, K, Tf, 2)
-
-    # ── forward ───────────────────────────────────────────────────────────────
+        self.nb_kin_dim = nb_kin_dim
+        self.Tf         = Tf
 
     def forward(
         self,
@@ -431,56 +291,28 @@ class SlotWeightProbe(nn.Module):
         pred    : (B, Tf, 2)
         weights : (B, K)   — absent slots은 0
         """
-        slot_enc, ego_enc, nb_exist = self._encode(x_nb, x_ego, nb_mask)
+        # ── time-average (mask 적용) ──
+        mask    = nb_mask.unsqueeze(-1).float()           # (B, T, K, 1)
+        nb_sum  = (x_nb * mask).sum(dim=1)                # (B, K, NB_DIM)
+        nb_cnt  = mask.sum(dim=1).clamp(min=1.0)          # (B, K, 1)
+        nb_avg  = nb_sum / nb_cnt                          # (B, K, NB_DIM)
+        ego_avg = x_ego.mean(dim=1)                        # (B, EGO_DIM)
 
-        logits  = self.weight_net(slot_enc, ego_enc)
-        logits  = logits.masked_fill(~nb_exist, float("-inf"))
-        weights = torch.softmax(logits, dim=-1)
-        weights = torch.nan_to_num(weights, nan=0.0)                       # (B, K)
+        # ── slot weights (masked softmax over occupied slots) ──
+        logits   = self.weight_net(nb_avg, ego_avg)        # (B, K) raw logits
+        nb_exist = nb_mask.any(dim=1)                      # (B, K) bool
+        logits   = logits.masked_fill(~nb_exist, float("-inf"))
+        weights  = torch.softmax(logits, dim=-1)           # (B, K), 합=1 (occupied slots)
+        weights  = torch.nan_to_num(weights, nan=0.0)      # 모든 slot absent인 edge case 처리
 
-        slot_preds = self._slot_preds(slot_enc, ego_enc)                   # (B, K, Tf, 2)
-        pred = (weights[:, :, None, None] * slot_preds).sum(dim=1)        # (B, Tf, 2)
-        return pred, weights
+        # ── weighted sum of kinematics ──
+        nb_kin = nb_avg[..., : self.nb_kin_dim]            # (B, K, NB_KIN)
+        w_nb   = (nb_kin * weights.unsqueeze(-1)).sum(dim=1)  # (B, NB_KIN)
 
-    def forward_stage1(
-        self,
-        x_nb: torch.Tensor,
-        x_ego: torch.Tensor,
-        nb_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Stage 1 전용: per-slot direct supervision.
+        # ── predict ──
+        feat = torch.cat([w_nb, ego_avg], dim=-1)          # (B, NB_KIN + EGO_DIM)
+        pred = self.predictor(feat).view(-1, self.Tf, 2)   # (B, Tf, 2)
 
-        각 슬롯이 자신의 temporal encoding만으로 ego trajectory를 독립 예측하도록
-        ground truth를 K개 슬롯 각각에 직접 적용.
-
-        → slot_pred_k들이 서로 다른 예측을 내도록 강제
-          (uniform-weighted MSE에서는 모든 슬롯이 marginal mean trajectory로 수렴하는 문제 해소)
-        → Stage 2에서 weight_net이 실제로 "어느 슬롯이 더 맞는가"를 선택할 수 있게 됨
-
-        Returns
-        -------
-        slot_preds : (B, K, Tf, 2)  — 슬롯별 ego trajectory 예측
-        nb_exist   : (B, K) bool    — loss masking용 (absent slot 제외)
-        """
-        slot_enc, ego_enc, nb_exist = self._encode(x_nb, x_ego, nb_mask)
-        slot_preds = self._slot_preds(slot_enc, ego_enc)   # (B, K, Tf, 2)
-        return slot_preds, nb_exist
-
-    def forward_uniform(
-        self,
-        x_nb: torch.Tensor,
-        x_ego: torch.Tensor,
-        nb_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """균등 가중치 weighted sum — Stage 1 val 모니터링용."""
-        slot_enc, ego_enc, nb_exist = self._encode(x_nb, x_ego, nb_mask)
-
-        nb_exist_f = nb_exist.float()
-        weights    = nb_exist_f / nb_exist_f.sum(dim=-1, keepdim=True).clamp(min=1.0)
-
-        slot_preds = self._slot_preds(slot_enc, ego_enc)
-        pred = (weights[:, :, None, None] * slot_preds).sum(dim=1)
         return pred, weights
 
 
@@ -631,7 +463,6 @@ def visualize_by_lc_group(
         group_name = LC_GROUP_NAMES[grp]
         n_samples  = len(weights)
 
-        # ── weight panel ──
         ax = axes[0, col]
         ax.bar(x, means, yerr=stds, capsize=4,
                color=colors[grp], alpha=0.85, label="mean ± std")
@@ -641,7 +472,6 @@ def visualize_by_lc_group(
         ax.set_title(f"[G{grp}] {group_name}\n(N={n_samples:,})", fontsize=10)
         ax.legend(fontsize=8)
 
-        # ── occupancy panel ──
         ax2 = axes[1, col]
         ax2.bar(x, occs, color=colors[grp], alpha=0.6)
         ax2.set_xticks(x)
@@ -649,7 +479,6 @@ def visualize_by_lc_group(
         ax2.set_ylabel("Slot occupancy (%)" if col == 0 else "")
         ax2.set_ylim(0, 105)
 
-        # ── console table ──
         print(f"\n{'='*60}")
         print(f"  [G{grp}] {group_name}  (N={n_samples:,})")
         print(f"  LC types: {LC_GROUPS[grp]} = {[LC_TYPE_NAMES[t] for t in LC_GROUPS[grp]]}")
@@ -673,7 +502,7 @@ def visualize_lc_group_surroundings(
     out_path: str,
 ) -> None:
     """
-    4-group directional LC별 pre / during / post slot weights 비교 시각화.
+    4-group directional LC별 pre / post slot weights 비교 시각화.
 
     results : {group_id: {lc_phase: (weights, occupancy)}}
       group_id: 0=leftmost→right, 1=middle→right, 2=middle→left, 3=rightmost→left
@@ -719,7 +548,6 @@ def visualize_lc_group_surroundings(
         ax2.set_ylabel("Slot occupancy (%)" if col == 0 else "")
         ax2.set_ylim(0, 105)
 
-        # ── console table ──
         print(f"\n{'='*60}")
         print(f"  [G{grp}] {LC_GROUP_NAMES[grp]}")
         print(f"  LC types: {LC_GROUPS[grp]} = {[LC_TYPE_NAMES[t] for t in LC_GROUPS[grp]]}")
@@ -731,7 +559,7 @@ def visualize_lc_group_surroundings(
                 ratio = means[k] / uniform if uniform > 0 else float("nan")
                 print(f"    {name:<20} {means[k]:>7.4f}  occ={occs[k]:>5.1f}%  {ratio:>6.2f}x")
 
-    fig.suptitle(f"Slot weights: pre / during / post LC by group — {tag}", fontsize=12, y=1.01)
+    fig.suptitle(f"Slot weights: pre / post LC by group — {tag}", fontsize=12, y=1.01)
     plt.tight_layout()
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
     print(f"\nSaved → {out_path}")
@@ -747,7 +575,7 @@ def visualize_lc_surroundings(
 
     results : {lc_type: {lc_phase: (weights, occupancy)}}
       lc_type  0-5  (LC_TYPE_NAMES)
-      lc_phase 0=pre (t0 이후 5s 내 LC), 2=post (hist_start 직전 5s 내 LC)
+      lc_phase 0=pre (t0 이후 2s 내 LC), 2=post (hist_start 직전 2s 내 LC)
     """
     lc_types = sorted(results.keys())
     if not lc_types:
@@ -793,7 +621,6 @@ def visualize_lc_surroundings(
         ax2.set_ylabel("Slot occupancy (%)" if col == 0 else "")
         ax2.set_ylim(0, 105)
 
-        # ── console table ────────────────────────────────────────────────────
         print(f"\n{'='*60}")
         print(f"  [{lc_tp}] {LC_TYPE_NAMES[lc_tp]}")
         for ph in sorted(phases.keys()):
@@ -806,7 +633,7 @@ def visualize_lc_surroundings(
                 ratio = means[k] / uniform if uniform > 0 else float("nan")
                 print(f"    {name:<20} {means[k]:>7.4f}  occ={occs[k]:>5.1f}%  {ratio:>6.2f}x")
 
-    fig.suptitle(f"Slot weights: pre / post LC (±5s) — {tag}", fontsize=12, y=1.01)
+    fig.suptitle(f"Slot weights: pre / post LC (±2s) — {tag}", fontsize=12, y=1.01)
     plt.tight_layout()
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
     print(f"\nSaved → {out_path}")
@@ -873,36 +700,16 @@ def build_loaders(
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
     return train_loader, val_loader
-
-
-def _eval_val(
-    model: SlotWeightProbe,
-    val_loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> tuple[float, np.ndarray, np.ndarray]:
-    """Val 루프 공통 로직 → (val_loss, weights, occupancy)."""
-    model.eval()
-    val_loss, all_weights, all_occupancy = 0.0, [], []
-    with torch.no_grad():
-        for ego, nb, mask, y in val_loader:
-            ego, nb, mask, y = ego.to(device), nb.to(device), mask.to(device), y.to(device)
-            pred, w = model(nb, ego, mask)
-            val_loss += criterion(pred, y).item() * len(ego)
-            all_weights.append(w.cpu().numpy())
-            all_occupancy.append(mask.any(dim=1).cpu().numpy())
-    val_loss /= len(val_loader.dataset)
-    return (
-        val_loss,
-        np.concatenate(all_weights,   axis=0),
-        np.concatenate(all_occupancy, axis=0),
-    )
 
 
 def train_one(
@@ -912,104 +719,79 @@ def train_one(
     val_loader: DataLoader,
     tag: str,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    2-stage 학습 → best val set의 (weights, occupancy) 반환.
+    """단일 모델 학습 → best val set의 (weights, occupancy) 반환."""
+    model     = SlotWeightProbe(d=args.d_hidden).to(device)
 
-    Stage 1 (pretrain_epochs): slot_encoder/ego_encoder/slot_predictor 학습, weight_net 동결.
-      - per-slot direct supervision: 각 슬롯이 ground truth trajectory를 독립적으로 예측.
-      - loss = mean_k[ MSE(slot_pred_k, y) ]  (absent slot 제외)
-      - 모든 슬롯이 각자 다른 예측을 내도록 강제 → slot_pred 다양성 확보.
-      - (uniform-weighted MSE를 쓰면 모든 슬롯이 marginal mean으로 수렴하는 문제 해소)
+    # torch.compile() — PyTorch 2.0+ 에서 GPU 커널 최적화
+    if hasattr(torch, "compile") and device.type == "cuda":
+        try:
+            model = torch.compile(model)
+        except Exception:
+            pass
 
-    Stage 2 (epochs): weight_net만 학습, Stage 1 파라미터 동결.
-      - 다양한 slot_pred들 중 실제 trajectory와 가장 일치하는 슬롯을 선택.
-      - slot_pred가 서로 다르므로 weight gradient가 실질적인 의미를 가짐.
-    """
-    model     = SlotWeightProbe(
-        d_enc=args.d_enc, d_hidden=args.d_hidden,
-        n_heads=args.n_heads, n_layers=args.n_layers,
-        dropout=args.dropout,
-    ).to(device)
-    safe_tag  = tag.replace(" ", "_").replace("/", "-")
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion = nn.MSELoss()
 
-    # ── Stage 1: per-slot direct supervision (weight_net 동결) ──────────────────
-    print(f"  [{tag}] Stage 1: per-slot direct supervision ({args.pretrain_epochs} epochs)")
-    for p in model.weight_net.parameters():
-        p.requires_grad_(False)
-
-    stage1_params = (
-        list(model.slot_encoder.parameters()) +
-        list(model.ego_encoder.parameters()) +
-        list(model.slot_emb.parameters()) +
-        list(model.slot_predictor.parameters())
-    )
-    opt1 = torch.optim.Adam(stage1_params, lr=args.lr)
-    sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=args.pretrain_epochs)
-
-    for epoch in range(1, args.pretrain_epochs + 1):
-        model.train()
-        train_loss = 0.0
-        for ego, nb, mask, y in train_loader:
-            ego, nb, mask, y = ego.to(device), nb.to(device), mask.to(device), y.to(device)
-
-            slot_preds, nb_exist = model.forward_stage1(nb, ego, mask)  # (B,K,Tf,2), (B,K)
-            # 슬롯별 MSE: absent slot 제외 후 평균
-            y_exp      = y.unsqueeze(1).expand_as(slot_preds)           # (B, K, Tf, 2)
-            slot_mse   = (slot_preds - y_exp).pow(2).mean(dim=(-2, -1)) # (B, K)
-            nb_exist_f = nb_exist.float()
-            loss = (slot_mse * nb_exist_f).sum() / nb_exist_f.sum().clamp(min=1.0)
-
-            opt1.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(stage1_params, 1.0)
-            opt1.step()
-            train_loss += loss.item() * len(ego)
-        train_loss /= len(train_loader.dataset)
-
-        # val: uniform weighted sum MSE (Stage 2 시작 기준선 모니터링)
-        val_loss, _, _ = _eval_val(model, val_loader, criterion, device)
-        sch1.step()
-        print(f"    Epoch {epoch:3d}/{args.pretrain_epochs} | train(per-slot)={train_loss:.6f}  val(uniform)={val_loss:.6f}")
-
-    # slot_predictor + slot_emb 동결, weight_net 해제
-    for p in stage1_params:
-        p.requires_grad_(False)
-    for p in model.weight_net.parameters():
-        p.requires_grad_(True)
-
-    # ── Stage 2: weight_net 학습 (predictor 동결) ──────────────────────────────
-    print(f"  [{tag}] Stage 2: weight_net training ({args.epochs} epochs, predictor frozen)")
-    opt2 = torch.optim.Adam(model.weight_net.parameters(), lr=args.lr)
-    sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=args.epochs)
+    use_amp = device.type == "cuda"
+    scaler  = GradScaler(enabled=use_amp)
 
     best_val_loss  = float("inf")
     best_weights   = None
     best_occupancy = None
 
     for epoch in range(1, args.epochs + 1):
+        # ── Train ──────────────────────────────────────────────────────────
         model.train()
         train_loss = 0.0
         for ego, nb, mask, y in train_loader:
-            ego, nb, mask, y = ego.to(device), nb.to(device), mask.to(device), y.to(device)
-            pred, _ = model(nb, ego, mask)
-            loss = criterion(pred, y)
-            opt2.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.weight_net.parameters(), 1.0)
-            opt2.step()
+            ego  = ego.to(device,  non_blocking=True)
+            nb   = nb.to(device,   non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            y    = y.to(device,    non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=use_amp):
+                pred, _ = model(nb, ego, mask)
+                loss = criterion(pred, y)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
             train_loss += loss.item() * len(ego)
         train_loss /= len(train_loader.dataset)
 
-        val_loss, all_w, all_occ = _eval_val(model, val_loader, criterion, device)
-        sch2.step()
-        print(f"    Epoch {epoch:3d}/{args.epochs} | train={train_loss:.6f}  val={val_loss:.6f}")
+        # ── Val ────────────────────────────────────────────────────────────
+        model.eval()
+        val_loss      = 0.0
+        all_weights   = []
+        all_occupancy = []
+        with torch.no_grad():
+            for ego, nb, mask, y in val_loader:
+                ego  = ego.to(device,  non_blocking=True)
+                nb   = nb.to(device,   non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+                y    = y.to(device,    non_blocking=True)
+
+                with autocast(enabled=use_amp):
+                    pred, w = model(nb, ego, mask)
+                val_loss += criterion(pred, y).item() * len(ego)
+                all_weights.append(w.cpu().numpy())
+                all_occupancy.append(mask.any(dim=1).cpu().numpy())  # (B, K)
+        val_loss /= len(val_loader.dataset)
+        scheduler.step()
+
+        print(f"  [{tag}] Epoch {epoch:3d}/{args.epochs} | train={train_loss:.6f}  val={val_loss:.6f}")
 
         if val_loss < best_val_loss:
             best_val_loss  = val_loss
-            best_weights   = all_w
-            best_occupancy = all_occ
-            torch.save(model.state_dict(), f"slot_weight_probe_{safe_tag}.pt")
+            best_weights   = np.concatenate(all_weights,   axis=0)   # (N_val, K)
+            best_occupancy = np.concatenate(all_occupancy, axis=0)   # (N_val, K)
+            safe_tag = tag.replace(" ", "_").replace("/", "-")
+            # torch.compile 된 모델에서 state_dict 추출
+            state = getattr(model, "_orig_mod", model).state_dict()
+            torch.save(state, f"slot_weight_probe_{safe_tag}.pt")
 
     assert best_weights is not None
     return best_weights, best_occupancy
@@ -1028,9 +810,6 @@ def _run_jobs(
 
     반환값: 입력 job dict에 'weights', 'occupancy' 를 추가한 리스트.
     샘플 없는 job은 결과에서 제외됨.
-
-    Note: GPU 학습은 단일 프로세스가 효율적. 데이터 로딩 병렬화는
-    DataLoader의 num_workers(현재 {args.num_workers})가 담당.
     """
     completed = []
     for job in jobs:
@@ -1060,13 +839,20 @@ def _run_jobs(
 
 
 def run(args: argparse.Namespace) -> None:
-    set_seed(args.seed)
+    if args.seed >= 0:
+        set_seed(args.seed)
+        print(f"Seed: {args.seed}")
+    else:
+        print("Seed: not fixed")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}  |  seed: {args.seed}")
+    print(f"Device: {device}")
+    if device.type == "cuda":
+        # benchmark는 deterministic=True와 함께 쓸 수 없으므로 시드 미고정 시에만 켬
+        torch.backends.cudnn.benchmark = (args.seed < 0)
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     if args.by_lane_level:
-        # filter_by_lane_level은 lane_level == lvl (정확히 0/1/2) 인 샘플만
-        # 통과시키므로, lane_level=-2 (history 안에 LC 포함) 샘플은 자동 제외됨.
         if args.data not in ("highD",):
             raise ValueError("--by_lane_level은 현재 highD 단독만 지원합니다.")
 
@@ -1097,7 +883,7 @@ def run(args: argparse.Namespace) -> None:
         ]
         group_surr: dict[int, dict[int, tuple[np.ndarray, np.ndarray]]] = {}
         for r in _run_jobs(args, device, jobs):
-            tag_s = r["tag"]  # e.g. "highD_lcg1_ph0"
+            tag_s = r["tag"]
             grp = int(tag_s.split("lcg")[1].split("_ph")[0])
             ph  = int(tag_s.split("_ph")[1])
             group_surr.setdefault(grp, {})[ph] = (r["weights"], r["occupancy"])
@@ -1162,38 +948,28 @@ def run(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Slot weight probe")
     parser.add_argument("--data",         choices=["highD", "exiD", "both"], default="highD")
-    parser.add_argument("--epochs",          type=int,   default=20)
-    parser.add_argument("--pretrain_epochs", type=int,   default=100,
-                        help="Stage 1: predictor pretraining epochs (균등 가중치, weight_net 동결)")
-    parser.add_argument("--batch_size",   type=int,   default=512)
+    parser.add_argument("--epochs",       type=int,   default=50)
+    parser.add_argument("--batch_size",   type=int,   default=1024)
     parser.add_argument("--lr",           type=float, default=1e-3)
-    parser.add_argument("--d_enc",        type=int,   default=64,
-                        help="temporal encoding dim (slot/ego Transformer 출력 dim)")
-    parser.add_argument("--d_hidden",     type=int,   default=64,
-                        help="weight_net MLP hidden dim")
-    parser.add_argument("--n_heads",      type=int,   default=4,
-                        help="Transformer attention heads (d_enc must be divisible)")
-    parser.add_argument("--n_layers",     type=int,   default=2,
-                        help="Transformer encoder layers")
-    parser.add_argument("--dropout",      type=float, default=0.1,
-                        help="Transformer dropout")
-    parser.add_argument("--seed",         type=int,   default=42,
-                        help="random seed for reproducibility")
+    parser.add_argument("--d_hidden",     type=int,   default=32,
+                        help="hidden dim of SlotWeightNet")
     parser.add_argument("--stat_samples", type=int,   default=50_000,
                         help="stats 계산에 사용할 max sample 수")
-    parser.add_argument("--num_workers",  type=int,   default=64)
+    parser.add_argument("--num_workers",  type=int,   default=128)
+    parser.add_argument("--seed",         type=int,   default=42,
+                        help="랜덤 시드 (-1이면 고정 안 함)")
     parser.add_argument("--by_lane_level", action="store_true",
                         help="lane-level(leftmost/middle/rightmost)별 분리 학습 (highD only). "
                              "combined PNG만 저장. 사전에 etc/analyze_lane_level.py 실행 필요.")
     parser.add_argument("--by_lc_group", action="store_true",
-                        help="LC 방향 4-group별 during-LC 샘플 학습 (highD only). "
+                        help="LC 방향 4-group별 pre/post-LC 샘플 학습 (highD only). "
                              "G0=leftmost→right, G1=middle→right, G2=middle→left, G3=rightmost→left. "
                              "사전에 etc/analyze_lane_level.py --recompute 실행 필요 (type 6/7 추가).")
     parser.add_argument("--by_lc_type", action="store_true",
                         help="LC 방향 6가지별 during-LC 샘플 학습 (highD only). "
                              "사전에 etc/analyze_lane_level.py 실행 필요.")
     parser.add_argument("--lc_surroundings", action="store_true",
-                        help="LC type별 pre/during/post 3단계 비교 학습 (highD only). "
+                        help="LC type별 pre/post 비교 학습 (highD only). "
                              "사전에 etc/analyze_lane_level.py 실행 필요.")
     args = parser.parse_args()
     run(args)
