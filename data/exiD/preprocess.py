@@ -21,23 +21,23 @@ x_nb   : (N, T, K, 13)   ego-relative neighbor features
     idx  4  dax       relative longitudinal acceleration
     idx  5  day       relative lateral acceleration
     idx  6  lc_state  lane-change state  {0: closing in, 1: stay, 2: moving out}
-    idx  7  lit       Longitudinal Interaction Time  dx / (dvx ± eps)
-    idx  8  lis       Longitudinal Interaction State (binned lit)
+    idx  7  volume    vehicle volume  width * length * height_est  (m³)
+    idx  8  size_bin  vehicle size bin (0~4) based on width*length*height_est
     idx  9  gate      1 if neighbor is active (gate_theta threshold or top-N selection)
     idx 10  I_x       longitudinal importance
     idx 11  I_y       lateral importance
     idx 12  I         composite importance  sqrt((I_x^2 + I_y^2) / 2)
 
-    With --non_relative: idx 0-5 hold the neighbor's own values in the
+    LIT/LIS are used internally for importance, matching highD, but are not
+    stored in x_nb. With --non_relative: idx 0-5 hold the neighbor's own values in the
     normalised reference frame instead of ego-relative differences.
-    lc_state/LIT/importance (idx 6-12) always use relative values.
+    lc_state/importance (idx 6, 9-12) always use relative values.
 
 y          : (N, Tf, 2)     future [x, y]  — ego-centric normalised frame
 y_vel      : (N, Tf, 2)     future [xV, yV] — normalised frame
 y_acc      : (N, Tf, 2)     future [xA, yA] — normalised frame
 nb_mask    : (N, T, K)      bool - True if neighbor exists
 x_last_abs : (N, 2)         last absolute (x, y) of ego history (pre-normalisation)
-ref_heading: (N,)            ego heading [rad] at last history frame (for inverse transform)
 meta_recordingId / trackId / t0_frame : (N,)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -106,11 +106,50 @@ NEIGHBOR_COLS_8 = [
 ]
 
 EGO_DIM = 6    # x, y, xV, yV, xA, yA
-NB_DIM  = 13   # dx, dy, dvx, dvy, dax, day, lc_state, lit, lis, gate, I_x, I_y, I
+NB_DIM  = 13   # dx, dy, dvx, dvy, dax, day, lc_state, volume, size_bin, gate, I_x, I_y, I
 K       = 8    # neighbor slots
 
 # Slot priority for top-N gate tie-breaking: 0 > 2 > 5 > 1 > 4 > 7 > 3 > 6
 _TOPN_SLOT_PRIORITY = {s: r for r, s in enumerate([0, 2, 5, 1, 4, 7, 3, 6])}
+
+# Empirical slot weights (mean I per slot, from highD dataset analysis).
+# Order: lead, rear, leftLead, leftAlongside, leftRear,
+#        rightLead, rightAlongside, rightRear
+SLOT_WEIGHTS = [0.4944, 0.0411, 0.0935, 0.0074, 0.0002, 0.5559, 0.0000, 0.1179]
+
+# Conditional slot weights copied from the highD preprocessing contract.
+SLOT_WEIGHTS_BY_LANE_LEVEL = [
+    [0.4255, 0.0336, 0.0000, 0.0000, 0.0000, 0.4574, 0.0119, 0.1190],
+    [0.4805, 0.0002, 0.0000, 0.0000, 0.0000, 0.3803, 0.0234, 0.1839],
+    [0.4784, 0.0373, 0.3344, 0.0343, 0.2050, 0.0000, 0.0000, 0.0000],
+]
+
+SLOT_WEIGHTS_PRE_LC = [
+    [0.0001, 0.0000, 0.0000, 0.0000, 0.0000, 0.6253, 0.2663, 0.3117],
+    [0.0072, 0.0263, 0.0006, 0.0000, 0.0000, 0.3970, 0.3776, 0.5494],
+    [0.0183, 0.1326, 0.6745, 0.5179, 0.2365, 0.0000, 0.0000, 0.0000],
+    [0.0381, 0.0233, 0.5755, 0.3548, 0.4799, 0.0000, 0.0000, 0.0000],
+]
+
+SLOT_WEIGHTS_POST_LC = [
+    [0.0460, 0.3983, 0.0000, 0.0023, 0.0762, 0.2338, 0.2022, 0.3281],
+    [0.1036, 0.0851, 0.4832, 0.0540, 0.3810, 0.0013, 0.0000, 0.0002],
+    [0.6018, 0.3591, 0.0115, 0.0013, 0.0099, 0.1709, 0.0069, 0.0014],
+    [0.2618, 0.0000, 0.0036, 0.0000, 0.0000, 0.6545, 0.2032, 0.1449],
+]
+
+_LC_TYPE_TO_GROUP: Dict[int, int] = {
+    0: 0, 1: 0,
+    3: 1, 6: 1,
+    2: 2, 7: 2,
+    4: 3, 5: 3,
+}
+
+_LC_TYPE_MAP_LEVEL: Dict[Tuple[int, int], int] = {
+    (0, 1): 0, (0, 2): 1,
+    (1, 0): 2, (1, 2): 3,
+    (2, 0): 4, (2, 1): 5,
+}
 
 
 def _apply_topn_gate(nb_row: np.ndarray, mask_row: np.ndarray, n: int) -> None:
@@ -124,6 +163,8 @@ def _apply_topn_gate(nb_row: np.ndarray, mask_row: np.ndarray, n: int) -> None:
     for k in valid:
         if k not in selected:
             nb_row[k, 9]  = 0.0
+            nb_row[k, 10] = 0.0
+            nb_row[k, 11] = 0.0
             nb_row[k, 12] = 0.0
 
 
@@ -136,19 +177,45 @@ EXID_DEFAULT_HZ = 25.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 LIS_BINS: Dict[str, Dict] = {
-    '3': {'cuts': [-3.7458, 4.9133],
+    '3': {'cuts': [-5.8639, 4.9525],
           'vals': [-1.0, 0.0, 1.0],
           'L': 1.0},
-    '5': {'cuts': [-10.0898, -1.5466, 2.5303, 11.4707],
+    '5': {'cuts': [-13.7033, -3.0238, 2.2735, 13.0957],
           'vals': [-2.0, -1.0, 0.0, 1.0, 2.0],
           'L': 2.0},
-    '7': {'cuts': [-14.5871, -5.6417, -0.8287, 1.6619, 6.8972, 16.0590],
+    '7': {'cuts': [-18.7902, -8.2922, -1.9963, 1.3381, 7.3744, 18.5267],
           'vals': [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
           'L': 3.0},
-    '9': {'cuts': [-18.2465, -8.7666, -3.7458, -0.5275, 1.2365, 4.9133, 10.1101, 19.7939],
+    '9': {'cuts': [-22.7661, -12.1209, -5.8639, -1.4829, 0.9127, 4.9525, 11.4115, 22.7702],
           'vals': [-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0],
           'L': 4.0},
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vehicle size bin
+# ─────────────────────────────────────────────────────────────────────────────
+
+_VOLUME_BIN_EDGES = [12.0, 20.0, 90.0, 150.0]
+
+
+def _volume_bin(phys_length: float, phys_width: float, vehicle_class: str) -> Tuple[float, float]:
+    """Return (size bin index 0~4, raw volume m³) for a neighbor vehicle."""
+    cls = (vehicle_class or "").strip().lower()
+    if cls in {"car", "van"}:
+        if phys_length < 4.5:
+            height = 1.45
+        elif phys_length < 5.0:
+            height = 1.70
+        else:
+            height = 1.90
+    else:
+        height = 2.75 if phys_length < 12.0 else 3.75
+    volume = phys_width * phys_length * height
+    for i, edge in enumerate(_VOLUME_BIN_EDGES):
+        if volume < edge:
+            return float(i), volume
+    return 4.0, volume
 
 
 def _lit_to_lis(lit: float, lis_mode: str) -> float:
@@ -199,6 +266,7 @@ class Config:
     # lc / gating
     t_front:  float = 3.0
     t_back:   float = 5.0
+    vy_eps:   float = 0.27
     eps_gate: float = 1.0
 
     # lc_state v2 (dvy-based) thresholds
@@ -207,7 +275,7 @@ class Config:
     dy_same:       float = 1.5
 
     # LIS mode
-    lis_mode: str = '7'   # '3' | '5' | '7' | '9'
+    lis_mode: str = '3'   # '3' | '5' | '7' | '9'
 
     # importance mode
     importance_mode: str = 'lis'  # 'lis' | 'lit'
@@ -215,6 +283,11 @@ class Config:
     # importance gate
     gate_theta: float = 0.0   # 0.0 = no threshold (all gates=1)
     gate_topn:  int   = 0     # >0 = keep top-N slots by I; 0 = disabled
+    gate_mask:  bool  = False # True → gate=0 neighbors are removed from nb_mask
+
+    # slot importance: I_new = min(I * (1 + alpha * w_slot), 1.0); 0.0 = disabled
+    slot_importance_alpha: float = 0.0
+    slot_importance_conditional: bool = False
 
     # lc_state version
     lc_version: str = "v3"    # "v1" | "v2" | "v3" | "v4" (lco_norm-based)
@@ -280,6 +353,72 @@ def compute_importance_lit(
                * np.exp(-p["by"] * delta_lane))
     i_total = float(np.sqrt((ix ** 2 + iy ** 2) / 2.0))
     return ix, iy, i_total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conditional slot weight helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _lane_id_to_level(lid: int, sorted_lids: List[int]) -> int:
+    """lane_id → lane_level (0=leftmost-ish, 1=middle, 2=rightmost-ish).
+
+    exiD lanelet IDs are not as globally regular as highD lane IDs. This helper
+    preserves the highD conditional-weight interface using the per-recording
+    sorted lanelet IDs as a conservative fallback.
+    """
+    n = len(sorted_lids)
+    if n == 0 or lid not in sorted_lids:
+        return -1
+    idx = sorted_lids.index(lid)
+    if n == 1:
+        return 1
+    if idx == 0:
+        return 0
+    if idx == n - 1:
+        return 2
+    return 1
+
+
+def _ego_lc_context(
+    ego_lane_arr: np.ndarray,
+    sorted_lids: List[int],
+) -> Tuple[int, Optional[int], int]:
+    lc_frame_ti: Optional[int] = None
+    lc_type = -1
+
+    for ti in range(1, len(ego_lane_arr)):
+        if ego_lane_arr[ti] != ego_lane_arr[ti - 1]:
+            lc_frame_ti = ti
+            from_lvl = _lane_id_to_level(int(ego_lane_arr[ti - 1]), sorted_lids)
+            to_lvl   = _lane_id_to_level(int(ego_lane_arr[ti]),     sorted_lids)
+            lc_type  = _LC_TYPE_MAP_LEVEL.get((from_lvl, to_lvl), -1)
+            break
+
+    if lc_frame_ti is None:
+        lane_level = _lane_id_to_level(int(ego_lane_arr[-1]), sorted_lids)
+    else:
+        lane_level = -2
+
+    return lane_level, lc_frame_ti, lc_type
+
+
+def _get_slot_weight(
+    ki: int,
+    ti: int,
+    lane_level: int,
+    lc_frame_ti: Optional[int],
+    lc_type: int,
+) -> float:
+    if lc_frame_ti is not None and lc_type >= 0:
+        lc_group = _LC_TYPE_TO_GROUP.get(lc_type, -1)
+        if lc_group < 0:
+            return SLOT_WEIGHTS[ki]
+        if ti < lc_frame_ti:
+            return SLOT_WEIGHTS_PRE_LC[lc_group][ki]
+        return SLOT_WEIGHTS_POST_LC[lc_group][ki]
+    if 0 <= lane_level <= 2:
+        return SLOT_WEIGHTS_BY_LANE_LEVEL[lane_level][ki]
+    return SLOT_WEIGHTS[ki]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,6 +674,10 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
         nb_id_cols.append(pd.to_numeric(s, errors="coerce").fillna(-1).astype(np.int32).to_numpy())
     nb_ids_all = np.stack(nb_id_cols, axis=1)   # (rows, 8)
 
+    lane_ids_rec: List[int] = []
+    if cfg.slot_importance_conditional:
+        lane_ids_rec = sorted(set(int(lid) for lid in lane_id if int(lid) >= 0))
+
     # ── sample 수집 루프 ──────────────────────────────────────────────────────
     x_ego_list:       List[np.ndarray] = []
     y_fut_list:       List[np.ndarray] = []
@@ -543,7 +686,6 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
     x_nb_list:        List[np.ndarray] = []
     nb_mask_list:     List[np.ndarray] = []
     x_last_abs_list:  List[np.ndarray] = []
-    ref_heading_list: List[float]      = []
     trackid_list:     List[int]        = []
     t0_list:          List[int]        = []
 
@@ -583,6 +725,14 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
             exa = xa[ego_rows]; eya = ya[ego_rows]
 
             ego_lane_arr = lane_id[ego_rows].astype(np.int32)
+
+            _lc_lane_lv: int = -1
+            _lc_frame_ti: Optional[int] = None
+            _lc_type: int = -1
+            if cfg.slot_importance_conditional and cfg.slot_importance_alpha > 0.0:
+                _lc_lane_lv, _lc_frame_ti, _lc_type = _ego_lc_context(
+                    ego_lane_arr, lane_ids_rec
+                )
 
             # ── ego heading per history frame ─────────────────────────────
             ego_hdg_arr = np.array(
@@ -702,13 +852,13 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                         if ki < 2:
                             lc_state = 0.0
                         elif ki < 5:   # left group
-                            if   vyn >  0.27: lc_state = -1.0
-                            elif vyn < -0.27: lc_state = -3.0
-                            else:             lc_state = -2.0
+                            if   vyn >  cfg.vy_eps: lc_state = -1.0
+                            elif vyn < -cfg.vy_eps: lc_state = -3.0
+                            else:                   lc_state = -2.0
                         else:          # right group
-                            if   vyn < -0.27: lc_state =  1.0
-                            elif vyn >  0.27: lc_state =  3.0
-                            else:             lc_state =  2.0
+                            if   vyn < -cfg.vy_eps: lc_state =  1.0
+                            elif vyn >  cfg.vy_eps: lc_state =  3.0
+                            else:                   lc_state =  2.0
                     elif cfg.lc_version == "v2":
                         _, dy_cc = _rot2d(
                             float(x[r]) - float(ex[ti]),
@@ -779,6 +929,17 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     else:
                         ix, iy, i_total = compute_importance_lis(lis, delta_lane, lc_state)
 
+                    # ── slot importance boost: I_new = I * (1 + alpha * w_slot)
+                    if cfg.slot_importance_alpha > 0.0:
+                        if cfg.slot_importance_conditional:
+                            w_slot = _get_slot_weight(ki, ti, _lc_lane_lv, _lc_frame_ti, _lc_type)
+                        else:
+                            w_slot = SLOT_WEIGHTS[ki]
+                        i_total = min(
+                            i_total * (1.0 + cfg.slot_importance_alpha * w_slot),
+                            1.0,
+                        )
+
                     # ── gate ──────────────────────────────────────────────
                     if cfg.gate_theta > 0.0:
                         gate = 1.0 if i_total >= cfg.gate_theta else 0.0
@@ -786,17 +947,28 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                         gate = 1.0  # gate_topn post-processing or all-active default
 
                     x_nb[ti, ki, 6]  = lc_state
-                    x_nb[ti, ki, 7]  = lit
-                    x_nb[ti, ki, 8]  = lis
+                    nb_class = class_map.get(nid, "car")
+                    size_bin, nb_volume = _volume_bin(nb_l, nb_w, nb_class)
+
                     i_total *= gate
+
+                    x_nb[ti, ki, 7]  = nb_volume
+                    x_nb[ti, ki, 8]  = size_bin
                     x_nb[ti, ki, 9]  = gate
-                    x_nb[ti, ki, 10] = ix
-                    x_nb[ti, ki, 11] = iy
+                    x_nb[ti, ki, 10] = ix * gate
+                    x_nb[ti, ki, 11] = iy * gate
                     x_nb[ti, ki, 12] = i_total
 
                 # ── top-N gate (applied after all slots are filled) ────
                 if cfg.gate_topn > 0:
                     _apply_topn_gate(x_nb[ti], nb_mask[ti], cfg.gate_topn)
+
+                # ── gate mask: remove gate=0 neighbors from nb_mask ────
+                if cfg.gate_mask:
+                    for ki in range(K):
+                        if nb_mask[ti, ki] and x_nb[ti, ki, 9] == 0.0:
+                            x_nb[ti, ki] = 0.0
+                            nb_mask[ti, ki] = False
 
             x_ego_list.append(x_ego)
             y_fut_list.append(y_fut)
@@ -805,7 +977,6 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
             x_nb_list.append(x_nb)
             nb_mask_list.append(nb_mask)
             x_last_abs_list.append(np.array([ref_x, ref_y], np.float32))
-            ref_heading_list.append(ref_hdg)
             trackid_list.append(int(v))
             t0_list.append(int(t0_frame))
 
@@ -823,8 +994,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
         "y_acc":       _safe_float(np.stack(y_acc_list,    0)),
         "x_nb":        _safe_float(np.stack(x_nb_list,     0)),
         "nb_mask":     np.stack(nb_mask_list, 0),
-        "x_last_abs":  np.stack(x_last_abs_list, 0),   # pre-normalisation position
-        "ref_heading": np.array(ref_heading_list, np.float32),  # radians
+        "x_last_abs":  np.stack(x_last_abs_list, 0),
         "recordingId": np.full(n_kept, int(rec_id), dtype=np.int32),
         "trackId":     np.array(trackid_list, np.int32),
         "t0_frame":    np.array(t0_list,      np.int32),
@@ -847,6 +1017,12 @@ def stage_raw2mmap(cfg: Config) -> None:
     print(f"  importance_mode : {cfg.importance_mode}"
           + (f"  lis_mode : {cfg.lis_mode}" if cfg.importance_mode == 'lis' else
              f"  params   : {IMPORTANCE_PARAMS_LIT}"))
+    if cfg.slot_importance_alpha > 0.0:
+        cond_str = "conditional (lane-level / pre-LC / post-LC)" if cfg.slot_importance_conditional else "global SLOT_WEIGHTS"
+        print(f"  slotImportance  : alpha={cfg.slot_importance_alpha}  weights={cond_str}  "
+              f"I_new = min(I * (1 + {cfg.slot_importance_alpha} * w_slot), 1.0)")
+    if cfg.gate_mask:
+        print(f"  gate_mask       : enabled  (gate=0 neighbors removed from nb_mask)")
     print(f"  drop_vru        : {cfg.drop_vru}")
     print(f"  non_relative    : {cfg.non_relative}")
 
@@ -883,7 +1059,6 @@ def stage_raw2mmap(cfg: Config) -> None:
         "x_nb":        open_memmap(out / "x_nb.npy",         "w+", "float32", (total, *s0["x_nb"].shape[1:])),
         "nb_mask":     open_memmap(out / "nb_mask.npy",      "w+", "bool",    (total, *s0["nb_mask"].shape[1:])),
         "x_last_abs":  open_memmap(out / "x_last_abs.npy",   "w+", "float32", (total, 2)),
-        "ref_heading": open_memmap(out / "ref_heading.npy",  "w+", "float32", (total,)),
     }
     meta_rec   = np.zeros(total, np.int32)
     meta_track = np.zeros(total, np.int32)
@@ -895,8 +1070,7 @@ def stage_raw2mmap(cfg: Config) -> None:
         n   = buf["x_ego"].shape[0]
         end = cursor + n
 
-        for key in ["x_ego", "y", "y_vel", "y_acc", "x_nb", "nb_mask",
-                    "x_last_abs", "ref_heading"]:
+        for key in ["x_ego", "y", "y_vel", "y_acc", "x_nb", "nb_mask", "x_last_abs"]:
             fp[key][cursor:end] = buf[key]
 
         meta_rec[cursor:end]   = buf["recordingId"]
@@ -939,6 +1113,8 @@ def parse_args() -> Config:
     # lc / gating
     ap.add_argument("--t_front",  type=float, default=3.0)
     ap.add_argument("--t_back",   type=float, default=5.0)
+    ap.add_argument("--vy_eps",   type=float, default=0.27,
+                    help="latVelocity threshold used only by lc_version=v1")
     ap.add_argument("--eps_gate", type=float, default=1.0,
                     help="eps for lit denominator clamp")
     ap.add_argument("--dvy_eps_cross", type=float, default=0.26,
@@ -949,7 +1125,7 @@ def parse_args() -> Config:
                     help="lc_state v2: |dy| < dy_same means same-lane for slot 0/1")
 
     # LIS
-    ap.add_argument("--lis_mode", default="9",
+    ap.add_argument("--lis_mode", default="7",
                     choices=["3", "5", "7", "9"],
                     help="LIS binning mode: 3={-1,0,1} | 5={-2,...,2} | 7={-3,...,3} | 9={-4,...,4}")
 
@@ -962,7 +1138,18 @@ def parse_args() -> Config:
     ap.add_argument("--gate_topn", type=int, default=0,
                     help="Top-N gate: keep up to N slots with highest I; "
                          "tie-break by slot priority 0>2>5>1>4>7>3>6. 0 = disabled")
-    ap.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3", "v4"],
+    ap.add_argument("--gate_mask", action="store_true", default=False,
+                    help="If set, gate=0 neighbors are removed from nb_mask entirely "
+                         "(zeroed features + nb_mask=False). Requires gate_theta or gate_topn.")
+    ap.add_argument("--slotImportance", type=float, default=0.0,
+                    dest="slot_importance_alpha",
+                    help="Slot importance boost alpha: I_new = min(I * (1 + alpha * w_slot), 1.0). "
+                         "w_slot = empirical mean I per slot. 0.0 = disabled (default)")
+    ap.add_argument("--slotImportanceConditional", action="store_true", default=False,
+                    dest="slot_importance_conditional",
+                    help="Use lane-level / pre-LC / post-LC specific slot weights "
+                         "instead of the global SLOT_WEIGHTS. Requires --slotImportance > 0.")
+    ap.add_argument("--lc_version", default="v4", choices=["v1", "v2", "v3", "v4"],
                     help="lc_state 계산 방식: "
                          "v1=slot기반 절대yV | "
                          "v2=dvy기반+slot/dy조합 | "
@@ -979,7 +1166,7 @@ def parse_args() -> Config:
     ap.add_argument("--non_relative", action="store_true", default=False,
                     help="x_nb[0:6] = neighbor's abs values in normalised frame "
                          "(instead of ego-relative differences). "
-                         "lc_state/LIT/importance (x_nb[6:12]) always use relative values.")
+                         "lc_state/importance (x_nb[6], x_nb[9:12]) always use relative values.")
 
     ap.add_argument("--dry_run", action="store_true")
 
@@ -997,6 +1184,7 @@ def parse_args() -> Config:
         stride_sec   = a.stride_sec,
         t_front      = a.t_front,
         t_back       = a.t_back,
+        vy_eps       = a.vy_eps,
         eps_gate      = a.eps_gate,
         dvy_eps_cross = a.dvy_eps_cross,
         dvy_eps_same  = a.dvy_eps_same,
@@ -1005,6 +1193,9 @@ def parse_args() -> Config:
         importance_mode = a.importance_mode,
         gate_theta      = a.gate_theta,
         gate_topn       = a.gate_topn,
+        gate_mask       = a.gate_mask,
+        slot_importance_alpha        = a.slot_importance_alpha,
+        slot_importance_conditional  = a.slot_importance_conditional,
         lc_version    = a.lc_version,
         drop_vru    = drop_vru,
         non_relative = a.non_relative,

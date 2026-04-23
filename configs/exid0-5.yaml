@@ -1,19 +1,19 @@
-exp_tag : ngsim0-1   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
+exp_tag : exid0-5   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 
 # =========================
 # DATA
 # =========================
 data:
-  mmap_dir   : data/NGSIM/c0
-  splits_dir : data/NGSIM/splits
-  stats_dir  : data/NGSIM/stats_c0
+  mmap_dir   : data/exiD/c7
+  splits_dir : data/exiD/splits
+  stats_dir  : data/exiD/stats_c7
 
   hz          : 3.0
   batch_size  : 1024
   num_workers : 64
 
   # scenario labels (optional — 없으면 stratified eval/sampling 비활성화)
-  scenario_labels: data/NGSIM/c0/scenario_labels.csv
+  scenario_labels: data/exiD/c7/scenario_labels.csv
 
 
 # =========================
@@ -61,7 +61,7 @@ model:
 # =========================
 train:
   device : cuda
-  seed   : 42
+  seed   : 777
 
   epochs        : 100
   lr            : 3e-4
