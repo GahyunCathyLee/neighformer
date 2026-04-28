@@ -10,7 +10,7 @@ data:
 
   hz          : 3.0
   batch_size  : 1024
-  num_workers : 64
+  num_workers : 24
 
   # scenario labels (optional — 없으면 stratified eval/sampling 비활성화)
   scenario_labels: data/exiD/c7/scenario_labels.csv
@@ -63,7 +63,7 @@ train:
   device : cuda
   seed   : 3407
 
-  epochs        : 100
+  epochs        : 200
   lr            : 3e-4
   weight_decay  : 0.0
   use_amp       : false
@@ -81,6 +81,6 @@ train:
 
   # logging / ckpt
   monitor   : val_ade     # val_loss | val_ade | val_fde | val_rmse
-  ckpt_dir  : ckpts
+  ckpt_dir  : /content/drive/MyDrive/TrajectoryPrediction/neighformer/ckpts
 
   stratified_eval: false
