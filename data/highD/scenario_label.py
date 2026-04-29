@@ -3,9 +3,8 @@
 """
 scenario_label.py  —  Window-level scenario labeling for highD tracks.
 
-Event labels (3-class):
-    cut_in          : lane change into a gap with rear/alongside traffic on the target side
-    lane_change     : lane change with no rear/alongside vehicle on the target side
+Event labels (2-class):
+    lane_change     : lane change in the window
     lane_following  : no lane change in the window
 
 State labels (2-class):
@@ -364,13 +363,10 @@ def label_window(
 
     Event labels
     ────────────
-    cut_in          : LC detected + rear/alongside in adjacent lane on target side
-    lane_change     : LC detected + no such vehicle (clear gap)
+    lane_change     : LC detected
     lane_following  : no LC detected
 
-    Note: direction ambiguity no longer produces a separate class.
-    If direction is unknown but LC occurred, it is classified as lane_change
-    (we cannot confirm cut-in without knowing the target side).
+    Note: cut_in is intentionally folded into lane_change.
 
     Parameters
     ----------
@@ -396,17 +392,14 @@ def label_window(
         out["has_adj_rear_or_alongside"] = False
         return out
 
-    # ── LC confirmed: determine direction ────────────────────────────────────
+    # ── LC confirmed: all LC windows are folded into lane_change ─────────────
     direction = infer_lc_direction(w, lc_frame=lc_frame, K=lc_direction_K)
     out["lc_direction"] = direction if direction is not None else "unknown"
-
-    # ── Direction unknown: cannot confirm cut-in → lane_change ───────────────
     if direction is None:
         out["event_label"]              = "lane_change"
         out["has_adj_rear_or_alongside"] = False
         return out
 
-    # ── Check rear/alongside presence on target side ─────────────────────────
     has_adj = check_adjacent_rear_or_alongside(
         w=w,
         lc_frame=lc_frame,
@@ -415,7 +408,7 @@ def label_window(
         W=W_adj,
     )
     out["has_adj_rear_or_alongside"] = bool(has_adj)
-    out["event_label"] = "cut_in" if has_adj else "lane_change"
+    out["event_label"] = "lane_change"
 
     return out
 
