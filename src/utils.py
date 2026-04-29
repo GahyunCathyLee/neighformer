@@ -3,10 +3,7 @@
 """
 utils.py — General-purpose utilities and stats helpers.
 
-Stats 파일명 규칙  (make_stats_filename)
-────────────────────────────────────────
-  TB{t_back}_TF{t_front}_vy{vy_eps*100:02d}.npz
-  예) TB5_TF3_vy27.npz
+Stats 파일명 규칙은 src.stats.make_stats_filename() 에서 관리합니다.
 """
 
 from __future__ import annotations

@@ -8,13 +8,13 @@ Event labels (2-class):
     lane_following  : no lane change in the window
 
 State labels (2-class):
-    dense     : occupancy <= 0.40
-    free_flow : occupancy >  0.40
+    dense     : occupancy >  0.40
+    free_flow : occupancy <= 0.40
 
-    occupancy   = nb_mask[:, :, STATE_SLOTS].mean(axis=(1,2))
+    occupancy   = selected-neighbor occupancy over history frames
     STATE_SLOTS = [0, 2, 3, 5, 6]  (front + adjacent lead/alongside, no rear slots)
     Threshold 0.40 derived from KDE valley of the occupancy distribution.
-    Computed directly from mmap nb_mask, not from raw tracks.
+    Prefer raw neighbor-id columns so the label is not distorted by top-N gating.
 
 Usage (standalone):
     python scenario_label.py \\
@@ -51,7 +51,13 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────────────────────────────────────
 
 STATE_SLOTS     = [0, 2, 3, 5, 6]   # front + adj lead/alongside (no rear)
-STATE_THRESHOLD = 0.40               # occupancy <= 0.40 → dense, else free_flow
+STATE_RAW_COLS  = ["leadId", "leftLeadId", "leftAlongsideId", "rightLeadId", "rightAlongsideId"]
+STATE_THRESHOLD = 0.40               # occupancy > 0.40 → dense, else free_flow
+
+
+def labels_from_occupancy(occ: np.ndarray) -> np.ndarray:
+    """Map neighbor occupancy to traffic state labels."""
+    return np.where(occ > STATE_THRESHOLD, "dense", "free_flow")
 
 
 def compute_state_labels(nb_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -68,8 +74,27 @@ def compute_state_labels(nb_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     occ          : (N,) float32    —  raw occupancy value
     """
     occ    = nb_mask[:, :, STATE_SLOTS].astype(np.float32).mean(axis=(1, 2))
-    labels = np.where(occ <= STATE_THRESHOLD, "dense", "free_flow")
+    labels = labels_from_occupancy(occ)
     return labels, occ
+
+
+def compute_raw_state_label(history: pd.DataFrame) -> Tuple[str, float]:
+    """
+    Compute state label from raw highD neighbor-id columns over history frames.
+
+    This intentionally uses raw neighbor presence instead of mmap nb_mask because
+    nb_mask may already have top-N gating applied for model input.
+    """
+    if history.empty:
+        return "unknown", float("nan")
+
+    cols = [c for c in STATE_RAW_COLS if c in history.columns]
+    if len(cols) != len(STATE_RAW_COLS):
+        return "unknown", float("nan")
+
+    vals = history[cols].apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy()
+    occ = float((vals > 0).mean())
+    return str(labels_from_occupancy(np.array([occ]))[0]), occ
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -491,8 +516,14 @@ def label_recording(
                 rows.append({**base, "event_label": "unknown",
                               "lc_frame": -1, "lc_count": 0,
                               "lc_direction": "unknown",
-                              "has_adj_rear_or_alongside": False})
+                              "has_adj_rear_or_alongside": False,
+                              "state_label": "unknown",
+                              "occupancy": float("nan")})
                 continue
+
+            hist_frames = [int(t0_frame) - (T - 1 - i) * ds_step for i in range(T)]
+            hist = g[g["frame"].astype(int).isin(hist_frames)]
+            state_label, occupancy = compute_raw_state_label(hist)
 
             t1_frame = int(t0_frame) + win_native
             w = g[(g["frame"] >= t0_frame) & (g["frame"] <= t1_frame)]
@@ -501,11 +532,13 @@ def label_recording(
                 rows.append({**base, "event_label": "unknown",
                               "lc_frame": -1, "lc_count": 0,
                               "lc_direction": "unknown",
-                              "has_adj_rear_or_alongside": False})
+                              "has_adj_rear_or_alongside": False,
+                              "state_label": state_label,
+                              "occupancy": occupancy})
                 continue
 
             result = label_window(w, lookup=lookup, W_adj=W_adj)
-            rows.append({**base, **result})
+            rows.append({**base, **result, "state_label": state_label, "occupancy": occupancy})
 
     else:
         # ── standalone mode: enumerate windows via stride ─────────────────────
@@ -522,6 +555,9 @@ def label_recording(
                 t1 = t0 + win_native
                 w = g[(g["frame"] >= t0) & (g["frame"] <= t1)]
                 if len(w) > 0:
+                    hist_frames = [int(t0) + i * ds_step for i in range(T)]
+                    hist = g[g["frame"].astype(int).isin(hist_frames)]
+                    state_label, occupancy = compute_raw_state_label(hist)
                     result = label_window(w, lookup=lookup, W_adj=W_adj)
                     rows.append({
                         "recordingId": rid,
@@ -533,6 +569,8 @@ def label_recording(
                         "history_sec": history_sec,
                         "future_sec":  future_sec,
                         "target_hz":   target_hz,
+                        "state_label": state_label,
+                        "occupancy":   occupancy,
                         **result,
                     })
                 t0 += stride_native
@@ -631,6 +669,10 @@ def main() -> None:
             state_labels, state_occ  = compute_state_labels(nb_mask_arr)
             print(f"  state dense={(state_labels=='dense').mean()*100:.1f}%  "
                   f"free_flow={(state_labels=='free_flow').mean()*100:.1f}%")
+            if float(state_occ.max()) <= STATE_THRESHOLD:
+                print("  [WARN] nb_mask occupancy never exceeds the dense threshold. "
+                      "If preprocessing used --gate_topn, raw neighbor IDs will be used "
+                      "for state labels instead of gated nb_mask.")
         else:
             state_labels = None
             state_occ    = None
@@ -672,6 +714,8 @@ def main() -> None:
                 idx_map = {(tid, t0): mmap_idx_list[i]
                            for i, (tid, t0) in enumerate(keys_for_rec)}
                 for row in rows:
+                    if row.get("state_label") != "unknown" and np.isfinite(row.get("occupancy", np.nan)):
+                        continue
                     mi = idx_map.get((row["trackId"], row["t0_frame"]))
                     if mi is not None:
                         row["state_label"] = state_labels[mi]

@@ -19,19 +19,16 @@ data:
 # =========================
 # FEATURES
 # stats 파일명은 이 설정으로 자동 결정됨
-# e.g. ego_mode=p, nb_kin_mode=pva, use_gate=true → ego_p__pva_gate.npz
+# e.g. ego_mode=p, nb_kin_mode=pva, use_s_x=true → ego_p__pva_sx.npz
 # =========================
 features:
   ego_mode     : pva        # p=[x,y] | pv=[x,y,vx,vy] | pva=[x,y,vx,vy,ax,ay]
   nb_kin_mode  : pva      # p | v | a | pv | pa | va | pva | none
-  use_lc_state : false
-  use_dx_time  : false
-  use_lit      : false
-  use_lis      : false
-  use_gate     : false
-  use_I_x      : false
-  use_I_y      : false
+  use_s_x      : false
+  use_s_y      : false
+  use_dim      : false
   use_I        : false
+
 
 
 # =========================

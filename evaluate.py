@@ -57,12 +57,9 @@ def _build_dataset(
         stats         = stats,
         ego_mode      = str(feat.get("ego_mode",     "pva")),
         nb_kin_mode   = str(feat.get("nb_kin_mode",  "pva")),
-        use_lc_state  = bool(feat.get("use_lc_state", False)),
-        use_lit       = bool(feat.get("use_lit",      False)),
-        use_lis       = bool(feat.get("use_lis",      False)),
-        use_gate      = bool(feat.get("use_gate",     False)),
-        use_I_x       = bool(feat.get("use_I_x",      False)),
-        use_I_y       = bool(feat.get("use_I_y",      False)),
+        use_s_x       = bool(feat.get("use_s_x",      False)),
+        use_s_y       = bool(feat.get("use_s_y",      False)),
+        use_dim       = bool(feat.get("use_dim",      False)),
         use_I         = bool(feat.get("use_I",         False)),
         return_meta   = return_meta,
     )
@@ -447,12 +444,9 @@ def main() -> None:
     stats_fname = make_stats_filename(
         ego_mode     = str(feat_cfg.get("ego_mode",    "pva")),
         nb_kin_mode  = str(feat_cfg.get("nb_kin_mode", "pva")),
-        use_lc_state = bool(feat_cfg.get("use_lc_state", False)),
-        use_lit      = bool(feat_cfg.get("use_lit",      False)),
-        use_lis      = bool(feat_cfg.get("use_lis",      False)),
-        use_gate     = bool(feat_cfg.get("use_gate",     False)),
-        use_I_x      = bool(feat_cfg.get("use_I_x",      False)),
-        use_I_y      = bool(feat_cfg.get("use_I_y",      False)),
+        use_s_x      = bool(feat_cfg.get("use_s_x",      False)),
+        use_s_y      = bool(feat_cfg.get("use_s_y",      False)),
+        use_dim      = bool(feat_cfg.get("use_dim",      False)),
         use_I        = bool(feat_cfg.get("use_I",         False)),
     )
     stats = load_stats(stats_dir / stats_fname)

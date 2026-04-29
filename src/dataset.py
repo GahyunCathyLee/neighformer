@@ -6,7 +6,7 @@ dataset.py — PyTorch Dataset for highD mmap-preprocessed data.
 preprocess.py가 생성하는 파일 구조
 ────────────────────────────────────
   x_ego.npy          (N, T, 6)      ego features  [x, y, xV, yV, xA, yA]
-  x_nb.npy           (N, T, K, 13)  neighbor features (아래 참조)
+  x_nb.npy           (N, T, K, 10)  neighbor features (아래 참조)
   nb_mask.npy        (N, T, K)      bool — True if neighbor exists
   y.npy              (N, Tf, 2)     future position  [x, y]
   y_vel.npy          (N, Tf, 2)     future velocity  [xV, yV]
@@ -23,13 +23,10 @@ x_nb feature index map (preprocess.py 기준)
   3  dvy         relative lateral velocity
   4  dax         relative longitudinal acceleration
   5  day         relative lateral acceleration
-  6  lc_state    lane-change state  {0: closing in, 1: stay, 2: moving out}
-  7  lit         Longitudinal Interaction Time  dx / (dvx ± eps)
-  8  lis         Longitudinal Interaction State (binned lit)
-  9  gate        1 if importance >= threshold else 0
-  10 I_x         longitudinal importance
-  11 I_y         lateral importance
-  12 I           composite importance  sqrt((I_x^2 + I_y^2) / 2)
+  6  s_x         longitudinal interaction state (existing LIS)
+  7  s_y         sqrt(lc_state^2 + delta_lane^2)
+  8  dim         vehicle size bin
+  9  I           composite importance
 
 nb_kin_mode 옵션
 ────────────────
@@ -64,13 +61,10 @@ _EGO_MODE_SLICES: Dict[str, Any] = {
 # x_nb feature index constants  (preprocess.py 정의와 동일)
 # ──────────────────────────────────────────────────────────────────────────────
 _NB_IDX_KIN_END  = 6   # 0..5  kinematics
-_NB_IDX_LC       = 6
-_NB_IDX_LIT      = 7   # Longitudinal Interaction Time (renamed from dx_time)
-_NB_IDX_LIS      = 8   # Longitudinal Interaction State (new)
-_NB_IDX_GATE     = 9
-_NB_IDX_IX       = 10
-_NB_IDX_IY       = 11
-_NB_IDX_I        = 12
+_NB_IDX_SX       = 6
+_NB_IDX_SY       = 7
+_NB_IDX_DIM      = 8
+_NB_IDX_I        = 9
 
 _NB_KIN_MODE_SLICES: Dict[str, Any] = {
     "p":   slice(0, 2),
@@ -111,13 +105,10 @@ class HighDDataset(Dataset):
         "pva" → [x, y, vx, vy, ax, ay]  ego_dim=6  (default)
     nb_kin_mode : str
         "p" | "v" | "a" | "pv" | "pa" | "va" | "pva" | "none"
-    use_lc_state : bool   x_nb index 6
-    use_lit      : bool   x_nb index 7   Longitudinal Interaction Time
-    use_lis      : bool   x_nb index 8   Longitudinal Interaction State
-    use_gate     : bool   x_nb index 9
-    use_I_x      : bool   x_nb index 10
-    use_I_y      : bool   x_nb index 11
-    use_I        : bool   x_nb index 12
+    use_s_x      : bool   x_nb index 6
+    use_s_y      : bool   x_nb index 7
+    use_dim      : bool   x_nb index 8
+    use_I        : bool   x_nb index 9
     return_meta  : bool   recordingId / trackId / t0_frame 반환 여부
     """
 
@@ -131,12 +122,9 @@ class HighDDataset(Dataset):
         # ── neighbor kinematics ───────────────────────────────────────────────
         nb_kin_mode: str = "pva",
         # ── neighbor aux features ─────────────────────────────────────────────
-        use_lc_state: bool = True,
-        use_lit:      bool = True,
-        use_lis:      bool = True,
-        use_gate:     bool = True,
-        use_I_x:      bool = False,
-        use_I_y:      bool = False,
+        use_s_x:      bool = True,
+        use_s_y:      bool = True,
+        use_dim:      bool = True,
         use_I:        bool = False,
         # ── misc ─────────────────────────────────────────────────────────────
         return_meta: bool = False,
@@ -160,19 +148,16 @@ class HighDDataset(Dataset):
             )
         self.nb_kin_mode = nb_kin_mode
 
-        self.use_lc_state = use_lc_state
-        self.use_lit      = use_lit
-        self.use_lis      = use_lis
-        self.use_gate     = use_gate
-        self.use_I_x      = use_I_x
-        self.use_I_y      = use_I_y
+        self.use_s_x      = use_s_x
+        self.use_s_y      = use_s_y
+        self.use_dim      = use_dim
         self.use_I        = use_I
         self.return_meta  = return_meta
         self.stats        = stats
 
         # neighbor feature가 하나도 없는 경우 방어
         if nb_kin_mode == "none" and not any(
-            [use_lc_state, use_lit, use_lis, use_gate, use_I_x, use_I_y, use_I]
+            [use_s_x, use_s_y, use_dim, use_I]
         ):
             raise ValueError(
                 "All neighbor features are disabled. "
@@ -181,7 +166,7 @@ class HighDDataset(Dataset):
 
         # ── mmap 파일 로드 ────────────────────────────────────────────────────
         self._x_ego    = self._load("x_ego.npy")        # (N, T, 6)
-        self._x_nb     = self._load("x_nb.npy")         # (N, T, K, 13)
+        self._x_nb     = self._load("x_nb.npy")         # (N, T, K, 10)
         self._nb_mask  = self._load("nb_mask.npy")      # (N, T, K)
         self._y        = self._load("y.npy")             # (N, Tf, 2)
         self._x_last   = self._load("x_last_abs.npy")   # (N, 2)
@@ -238,7 +223,7 @@ class HighDDataset(Dataset):
         x_ego   = raw_ego[..., _EGO_MODE_SLICES[self.ego_mode]]    # (T, ego_dim)
 
         # ── neighbor features ─────────────────────────────────────────────────
-        raw_nb  = torch.from_numpy(self._x_nb[real_idx].copy())    # (T, K, 13)
+        raw_nb  = torch.from_numpy(self._x_nb[real_idx].copy())    # (T, K, 10)
         nb_mask = torch.from_numpy(self._nb_mask[real_idx].copy()) # (T, K)
 
         nb_parts: List[torch.Tensor] = []
@@ -254,18 +239,12 @@ class HighDDataset(Dataset):
             nb_parts.append(kin)
 
         # aux features
-        if self.use_lc_state:
-            nb_parts.append(raw_nb[..., _NB_IDX_LC   : _NB_IDX_LC   + 1])
-        if self.use_lit:
-            nb_parts.append(raw_nb[..., _NB_IDX_LIT  : _NB_IDX_LIT  + 1])
-        if self.use_lis:
-            nb_parts.append(raw_nb[..., _NB_IDX_LIS  : _NB_IDX_LIS  + 1])
-        if self.use_gate:
-            nb_parts.append(raw_nb[..., _NB_IDX_GATE : _NB_IDX_GATE + 1])
-        if self.use_I_x:
-            nb_parts.append(raw_nb[..., _NB_IDX_IX   : _NB_IDX_IX   + 1])
-        if self.use_I_y:
-            nb_parts.append(raw_nb[..., _NB_IDX_IY   : _NB_IDX_IY   + 1])
+        if self.use_s_x:
+            nb_parts.append(raw_nb[..., _NB_IDX_SX   : _NB_IDX_SX   + 1])
+        if self.use_s_y:
+            nb_parts.append(raw_nb[..., _NB_IDX_SY   : _NB_IDX_SY   + 1])
+        if self.use_dim:
+            nb_parts.append(raw_nb[..., _NB_IDX_DIM  : _NB_IDX_DIM  + 1])
         if self.use_I:
             nb_parts.append(raw_nb[..., _NB_IDX_I    : _NB_IDX_I    + 1])
 
@@ -327,12 +306,9 @@ class HighDDataset(Dataset):
                 dim += 4
             elif self.nb_kin_mode == "pva":
                 dim += 6
-        if self.use_lc_state: dim += 1
-        if self.use_lit:      dim += 1
-        if self.use_lis:      dim += 1
-        if self.use_gate:     dim += 1
-        if self.use_I_x:      dim += 1
-        if self.use_I_y:      dim += 1
+        if self.use_s_x:      dim += 1
+        if self.use_s_y:      dim += 1
+        if self.use_dim:      dim += 1
         if self.use_I:        dim += 1
         return dim
 
@@ -372,12 +348,9 @@ class HighDDataset(Dataset):
             "none": [],
         }
         nb: List[str] = list(_KIN_NAMES[self.nb_kin_mode])
-        if self.use_lc_state: nb.append("lc_state")
-        if self.use_lit:      nb.append("lit")
-        if self.use_lis:      nb.append("lis")
-        if self.use_gate:     nb.append("gate")
-        if self.use_I_x:      nb.append("I_x")
-        if self.use_I_y:      nb.append("I_y")
+        if self.use_s_x:      nb.append("s_x")
+        if self.use_s_y:      nb.append("s_y")
+        if self.use_dim:      nb.append("dim")
         if self.use_I:        nb.append("I")
 
         return {
