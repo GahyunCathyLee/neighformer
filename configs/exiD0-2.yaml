@@ -1,19 +1,19 @@
-exp_tag : exid0-5   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
+exp_tag : exiD0-2   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 
 # =========================
 # DATA
 # =========================
 data:
-  mmap_dir   : data/exiD/c7
+  mmap_dir   : data/exiD/dimI
   splits_dir : data/exiD/splits
-  stats_dir  : data/exiD/stats_c7
+  stats_dir  : data/exiD/stats_c0
 
   hz          : 3.0
   batch_size  : 1024
   num_workers : 24
 
   # scenario labels (optional — 없으면 stratified eval/sampling 비활성화)
-  scenario_labels: data/exiD/c7/scenario_labels.csv
+  scenario_labels: data/exiD/dimI/scenario_labels.csv
 
 
 # =========================
@@ -57,7 +57,7 @@ model:
 # =========================
 train:
   device : cuda
-  seed   : 777
+  seed   : 1234
 
   epochs        : 200
   lr            : 3e-4
