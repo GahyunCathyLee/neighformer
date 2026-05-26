@@ -85,6 +85,7 @@ NEIGHBOR_COLS_8 = [
 EGO_DIM = 6    # x, y, xV, yV, xA, yA
 NB_DIM  = 10   # dx, dy, dvx, dvy, dax, day, s_x, s_y, dim, I
 K       = 8    # neighbor slots
+LIT_DENOM_EPS = 0.3
 
 # Slot priority for top-N gate tie-breaking: 0 > 2 > 5 > 1 > 4 > 7 > 3 > 6
 _TOPN_SLOT_PRIORITY = {s: r for r, s in enumerate([0, 2, 5, 1, 4, 7, 3, 6])}
@@ -670,9 +671,7 @@ def _recording_to_buf(cfg: Config, rec_id: str) -> Optional[Dict[str, np.ndarray
                     else:        # nb behind: gap = x_rear_ego - x_front_nb
                         gap        = abs(-dx - half_sum)
                         denom_base = -dvx
-                    denom = denom_base
-                    if abs(denom) < 1e-6:
-                        denom = 1e-6 if denom >= 0 else -1e-6
+                    denom = denom_base + (LIT_DENOM_EPS if denom_base >= 0 else -LIT_DENOM_EPS)
                     lit = gap / denom
                     nb_class   = vid_to_class.get(nid, "Car")
                     nb_phys_l  = vid_to_w.get(nid, 0.0)   # CSV width = physical length
