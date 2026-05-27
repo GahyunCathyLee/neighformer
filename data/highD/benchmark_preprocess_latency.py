@@ -109,6 +109,7 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
         del last_buf
 
     mean_ms = statistics.fmean(latencies_ms)
+    per_sample_ms = [v / sample_count for v in latencies_ms] if sample_count else []
     result: Dict[str, Any] = {
         "recording_id": rec_id,
         "data_dir": str(cfg.data_dir),
@@ -125,8 +126,12 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
             "stdev": statistics.stdev(latencies_ms) if len(latencies_ms) > 1 else 0.0,
         },
         "latency_per_sample_ms": {
-            "mean": mean_ms / sample_count if sample_count else None,
-            "median": statistics.median(latencies_ms) / sample_count if sample_count else None,
+            "runs": per_sample_ms,
+            "mean": statistics.fmean(per_sample_ms) if per_sample_ms else None,
+            "median": statistics.median(per_sample_ms) if per_sample_ms else None,
+            "min": min(per_sample_ms) if per_sample_ms else None,
+            "max": max(per_sample_ms) if per_sample_ms else None,
+            "stdev": statistics.stdev(per_sample_ms) if len(per_sample_ms) > 1 else 0.0,
         },
         "shapes": shapes,
         "config": {
@@ -168,6 +173,9 @@ def print_report(result: Dict[str, Any]) -> None:
     print(f"stdev ms           : {latency['stdev']:.3f}")
     if per_sample["mean"] is not None:
         print(f"mean per sample ms : {per_sample['mean']:.6f}")
+        print(f"median/sample ms   : {per_sample['median']:.6f}")
+        print(f"min / max sample ms: {per_sample['min']:.6f} / {per_sample['max']:.6f}")
+        print(f"stdev/sample ms    : {per_sample['stdev']:.6f}")
     print(f"shapes             : {result['shapes']}")
 
 
