@@ -44,6 +44,16 @@ def _get(d: Dict, *keys, default=None):
     return d.get(keys[-1], default)
 
 
+def _compat_feature_cfg(feat: Dict[str, Any]) -> Dict[str, Any]:
+    """Map legacy checkpoint feature flags onto the current dataset flags."""
+    out = dict(feat)
+    if "use_s_x" not in out and bool(out.get("use_lis", False)):
+        out["use_s_x"] = True
+    if "use_s_y" not in out and bool(out.get("use_I_y", False)):
+        out["use_s_y"] = True
+    return out
+
+
 def _build_dataset(
     data_dir: Path,
     split_indices: np.ndarray,
@@ -391,6 +401,14 @@ def main() -> None:
                     help="Override num_workers from saved config")
     ap.add_argument("--device",           type=str, default=None,
                     help="Override device  (cuda / cpu)")
+    ap.add_argument("--mmap_dir",         type=str, default=None,
+                    help="Override data.mmap_dir from saved config")
+    ap.add_argument("--splits_dir",       type=str, default=None,
+                    help="Override data.splits_dir from saved config")
+    ap.add_argument("--stats_dir",        type=str, default=None,
+                    help="Override data.stats_dir from saved config")
+    ap.add_argument("--scenario_labels",  type=str, default=None,
+                    help="Override data.scenario_labels from saved config")
     ap.add_argument("--measure_time",     action="store_true",
                     help="Measure inference latency (1,000 warmup + 10,000 iters)")
     args = ap.parse_args()
@@ -422,19 +440,19 @@ def main() -> None:
 
     # ── 3. Config ─────────────────────────────────────────────────────────────
     data_cfg  = cfg.get("data",     {})
-    feat_cfg  = cfg.get("features", {})
+    feat_cfg  = _compat_feature_cfg(cfg.get("features", {}))
     train_cfg = cfg.get("train",    {})
 
-    mmap_dir   = resolve_path(data_cfg["mmap_dir"])
-    splits_dir = resolve_path(data_cfg["splits_dir"])
-    stats_dir  = resolve_path(data_cfg["stats_dir"])
+    mmap_dir   = resolve_path(args.mmap_dir   if args.mmap_dir   is not None else data_cfg["mmap_dir"])
+    splits_dir = resolve_path(args.splits_dir if args.splits_dir is not None else data_cfg["splits_dir"])
+    stats_dir  = resolve_path(args.stats_dir  if args.stats_dir  is not None else data_cfg["stats_dir"])
     data_hz    = float(data_cfg.get("hz", 3.0))
     use_amp    = bool(train_cfg.get("use_amp", True)) and (device.type == "cuda")
 
     # ── 4. Scenario labels (optional) ─────────────────────────────────────────
     labels_lut = None
     if args.scenario and not args.measure_time:
-        labels_path = data_cfg.get("scenario_labels", None)
+        labels_path = args.scenario_labels if args.scenario_labels is not None else data_cfg.get("scenario_labels", None)
         if labels_path:
             labels_lut = load_scenario_labels(resolve_path(labels_path))
         else:
