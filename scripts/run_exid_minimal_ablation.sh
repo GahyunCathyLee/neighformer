@@ -8,6 +8,8 @@ EVAL_SPLIT="${EVAL_SPLIT:-test}"
 RUN_EVAL="${RUN_EVAL:-1}"
 EVAL_SCENARIO="${EVAL_SCENARIO:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
+SHARD_INDEX="${SHARD_INDEX:-0}"
+SHARD_COUNT="${SHARD_COUNT:-1}"
 
 mkdir -p "${LOG_DIR}"
 
@@ -39,7 +41,34 @@ if [[ "${#CONFIGS[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-for cfg in "${CONFIGS[@]}"; do
+if (( SHARD_COUNT < 1 )); then
+  echo "[ERROR] SHARD_COUNT must be >= 1, got ${SHARD_COUNT}" >&2
+  exit 1
+fi
+if (( SHARD_INDEX < 0 || SHARD_INDEX >= SHARD_COUNT )); then
+  echo "[ERROR] SHARD_INDEX must be in [0, SHARD_COUNT), got ${SHARD_INDEX}/${SHARD_COUNT}" >&2
+  exit 1
+fi
+
+SELECTED_CONFIGS=()
+total="${#CONFIGS[@]}"
+start=$(( total * SHARD_INDEX / SHARD_COUNT ))
+end=$(( total * (SHARD_INDEX + 1) / SHARD_COUNT ))
+for i in "${!CONFIGS[@]}"; do
+  if (( i >= start && i < end )); then
+    SELECTED_CONFIGS+=("${CONFIGS[$i]}")
+  fi
+done
+
+echo "[INFO] Total configs: ${#CONFIGS[@]}"
+echo "[INFO] Running shard: ${SHARD_INDEX}/${SHARD_COUNT} (${#SELECTED_CONFIGS[@]} configs, indices ${start}..$((end - 1)))"
+
+if [[ "${#SELECTED_CONFIGS[@]}" -eq 0 ]]; then
+  echo "[ERROR] Selected shard is empty" >&2
+  exit 1
+fi
+
+for cfg in "${SELECTED_CONFIGS[@]}"; do
   tag="$(basename "${cfg%.yaml}")"
   ckpt="ckpts/${tag}/best.pt"
 
