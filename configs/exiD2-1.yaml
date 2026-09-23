@@ -1,4 +1,4 @@
-exp_tag : exiD1-1   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
+exp_tag : exiD2-1   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 
 # =========================
 # DATA
@@ -6,7 +6,7 @@ exp_tag : exiD1-1   # ckpts/{exp_tag}/, tensorboard/{exp_tag}/ 에 저장됨
 data:
   mmap_dir   : data/exiD/dimI
   splits_dir : data/exiD/splits
-  stats_dir  : data/exiD/stats_c1
+  stats_dir  : data/exiD/stats_c2
 
   hz          : 3.0
   batch_size  : 1024
@@ -26,7 +26,7 @@ features:
   nb_kin_mode  : pva      # p | v | a | pv | pa | va | pva | none
   use_s_x      : false
   use_s_y      : false
-  use_dim      : true
+  use_dim      : false
   use_I        : true
 
 
