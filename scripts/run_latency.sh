@@ -22,8 +22,6 @@ mkdir -p "$LOG_DIR"
 cases=(
   "exiD-baseline|ckpts/exiD0-5/best.pt"
   "exiD-+I|ckpts/exiD2-5/best.pt"
-  "highD-baseline|ckpts/highD0-4/best.pt"
-  "highD-+I|ckpts/highD2-3/best.pt"
 )
 
 for row in "${cases[@]}"; do
@@ -33,14 +31,10 @@ for row in "${cases[@]}"; do
   log_path="${LOG_DIR}/${name}.log"
 
   ckpt_key=""
-  if [[ "$dataset" == "exiD" && "$condition" == "baseline" ]]; then
+  if [[ "$condition" == "baseline" ]]; then
     ckpt_key="${EXID_BASE_CKPT:-}"
-  elif [[ "$dataset" == "exiD" ]]; then
+  else
     ckpt_key="${EXID_I_CKPT:-}"
-  elif [[ "$dataset" == "highD" && "$condition" == "baseline" ]]; then
-    ckpt_key="${HIGHD_BASE_CKPT:-}"
-  elif [[ "$dataset" == "highD" ]]; then
-    ckpt_key="${HIGHD_I_CKPT:-}"
   fi
   if [[ -n "$ckpt_key" ]]; then
     ckpt="$ckpt_key"
@@ -64,13 +58,8 @@ for row in "${cases[@]}"; do
 
   mmap_dir=""
   splits_dir=""
-  if [[ "$dataset" == "exiD" ]]; then
-    mmap_dir="${EXID_MMAP_DIR:-}"
-    splits_dir="${EXID_SPLITS_DIR:-}"
-  elif [[ "$dataset" == "highD" ]]; then
-    mmap_dir="${HIGHD_MMAP_DIR:-}"
-    splits_dir="${HIGHD_SPLITS_DIR:-}"
-  fi
+  mmap_dir="${EXID_MMAP_DIR:-}"
+  splits_dir="${EXID_SPLITS_DIR:-}"
   if [[ -z "$mmap_dir" && -n "${DATA_ROOT:-}" ]]; then
     mmap_dir="${DATA_ROOT}/${dataset}/dimI"
   fi
