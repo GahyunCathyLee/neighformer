@@ -367,7 +367,7 @@ def print_scenario_results(
 
 
 def print_latency(lat: Dict[str, float], batch_size: int, warmup: int, iters: int) -> None:
-    """Print latency avg / min / max table."""
+    """Print latency min / max / avg table."""
     c = 15
     ws = [c, c, c]
 
@@ -375,9 +375,9 @@ def print_latency(lat: Dict[str, float], batch_size: int, warmup: int, iters: in
     print(f"  Batch size : {batch_size}   Warmup : {warmup:,}   Measurement : {iters:,}")
     print()
     print(_sep(ws))
-    print(f"|{'Avg (ms)':^{c}}|{'Min (ms)':^{c}}|{'Max (ms)':^{c}}|")
+    print(f"|{'Min (ms)':^{c}}|{'Max (ms)':^{c}}|{'Avg (ms)':^{c}}|")
     print(_sep(ws))
-    print(f"|{lat['avg_ms']:^{c}.2f}|{lat['min_ms']:^{c}.2f}|{lat['max_ms']:^{c}.2f}|")
+    print(f"|{lat['min_ms']:^{c}.2f}|{lat['max_ms']:^{c}.2f}|{lat['avg_ms']:^{c}.2f}|")
     print(_sep(ws))
 
 
@@ -411,10 +411,11 @@ def main() -> None:
                     help="Override data.scenario_labels from saved config")
     ap.add_argument("--measure_time",     action="store_true",
                     help="Measure inference latency (1,000 warmup + 10,000 iters)")
+    ap.add_argument("--latency_warmup",   type=int, default=1000,
+                    help="Warmup iterations for --measure_time")
+    ap.add_argument("--latency_iters",    type=int, default=10000,
+                    help="Measurement iterations for --measure_time")
     args = ap.parse_args()
-
-    LATENCY_WARMUP = 1_000
-    LATENCY_ITERS  = 10_000
 
     # ── 1. Load checkpoint ────────────────────────────────────────────────────
     ckpt_path = Path(args.ckpt).resolve()
@@ -527,8 +528,8 @@ def main() -> None:
                     _resolve_pred_abs(pred, scores)
 
         print(f"\n====== Inference Latency ======")
-        lat = measure_latency(_infer, device, warmup=LATENCY_WARMUP, iters=LATENCY_ITERS)
-        print_latency(lat, batch_size=1, warmup=LATENCY_WARMUP, iters=LATENCY_ITERS)
+        lat = measure_latency(_infer, device, warmup=args.latency_warmup, iters=args.latency_iters)
+        print_latency(lat, batch_size=1, warmup=args.latency_warmup, iters=args.latency_iters)
 
     # ── 8b. Metric evaluation mode ────────────────────────────────────────────
     else:

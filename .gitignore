@@ -10,6 +10,5 @@ __pycache__/
 
 run_trains.sh
 
-*.yaml
-
-!configs/*.yaml
+past_configs/
+etc/
