@@ -1,20 +1,20 @@
-exp_tag: exiD_component_ablation_03_no_slot_s1234
+exp_tag: no_slot-2
 
 data:
-  mmap_dir: data/exiD/ablations/nf_top1
+  mmap_dir: data/exiD/no_slot
   splits_dir: data/exiD/splits
   stats_dir: data/exiD/stats_components/no_slot
   hz: 3.0
   batch_size: 512
   num_workers: 128
-  scenario_labels: data/exiD/ablations/nf_top1/scenario_labels.csv
+  scenario_labels: data/exiD/no_slot/scenario_labels.csv
 
 features:
   ego_mode: pva
   nb_kin_mode: pva
-  use_s_x: true
-  use_s_y: true
-  use_dim: true
+  use_s_x: false
+  use_s_y: false
+  use_dim: false
   use_I: true
 
 model:
