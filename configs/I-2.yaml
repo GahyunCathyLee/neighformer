@@ -46,5 +46,5 @@ train:
   lr_schedule: cosine
   warmup_steps: 500
   monitor: val_ade
-  ckpt_dir: ckpts
+  ckpt_dir: /content/drive/MyDrive/TrajectoryPrediction/neighformer/ckpts
   stratified_eval: false
